@@ -113,14 +113,37 @@ model Order {
   executed_qty    Decimal  @default(0)
   executed_quote_qty Decimal @default(0) // USDT volume
   
-  fee_usdt        Decimal  @default(0)
-  fee_asset       String?
+  is_anchor       Boolean  @default(false)
+  ladder_level    Int?     
   
-  is_anchor       Boolean  @default(false) // First buy in ladder
-  ladder_level    Int?     // 1 to 6
+  // Real Fee Tracking
+  fee_asset       String?  // BNB, BTC, USDT
+  fee_amount      Decimal  @default(0)
+  fee_usdt        Decimal  @default(0) // Normalized
+  fee_rate        Decimal  @default(0) // fee_usdt / executed_quote_qty
   
   @@index([status])
   @@map("orders")
+}
+
+model Candle {
+  open_time       DateTime @id
+  close_time      DateTime
+  
+  symbol          String
+  interval        String   // 15m
+  
+  open            Decimal
+  high            Decimal
+  low             Decimal
+  close           Decimal
+  volume          Decimal
+  quote_volume    Decimal
+  
+  trades_count    Int
+  
+  @@map("candles")
+  @@index([symbol, interval, open_time])
 }
 
 // ----------------------------------------------------------------------

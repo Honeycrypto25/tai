@@ -1,48 +1,119 @@
-import { PrismaClient } from '@prisma/client';
-import { config } from './config';
+import { prisma } from './lib/prisma';
+import { config, BotMode } from './config';
+import { market } from './services/market';
+import { stats } from './services/stats';
+import { binance } from './services/binance';
+import { PolicyEngine } from './core/policy'; // I need to move this or copy code
+import { Decimal } from 'decimal.js';
 
-const prisma = new PrismaClient();
+// Re-instantiate PolicyEngine here or ensure import works
+const policy = new PolicyEngine(prisma);
 
-async function main() {
-    console.log('-------------------------------------------');
-    console.log(` TAI BOT SYSTEM STARTING - MODE: ${config.MODE}`);
-    console.log('-------------------------------------------');
+async function runCycle() {
+    const cycleId = `cycle_${Date.now()}`;
+    console.log(`[CYCLE] Starting ${cycleId}...`);
 
     try {
-        // 1. Check DB Connection
-        console.log('[INIT] Connecting to Database...');
-        // We can run a simple query to verify connection
-        // Note: This might fail if the DB URL is dummy or network is down
-        // Since we don't have migrations run yet, we just check connectivity if possible or assume lazy connect
-        // await prisma.$connect(); 
-        console.log('[INIT] Database Client Initialized (Lazy).');
+        // 1. Sync Data
+        await market.syncCandles();
+        await market.captureDailySnapshot();
+        await stats.refreshFeeStats();
 
-        // 2. Load Settings from DB (if available)
-        // const settings = await prisma.globalSettings.findFirst();
-        // console.log('[INIT] Current Settings:', settings || "Defaults will be used (DB empty)");
+        // 2. Fetch State
+        const settings = await prisma.globalSettings.findFirst();
+        if (!settings) {
+            console.warn('[CYCLE] No settings found. Skipping.');
+            return;
+        }
 
-        // 3. Start Loop
-        console.log('[CORE] Starting Main Loop...');
+        if (!settings.trading_enabled && !settings.dry_run) {
+            console.log('[CYCLE] Trading disabled via Master Switch.');
+            return;
+        }
 
-        // Placeholder for loop
-        setInterval(() => {
-            // console.log(`[HEARTBEAT] ${new Date().toISOString()} - Bot is alive in ${config.MODE} mode.`);
-        }, 60000);
+        // 3. Analyze Market (Strategy Placeholder - usually ML or Heuristic)
+        // For now, we use a simple heuristic example as "Logic Real"
+        // Fetch last candle
+        const candle = await prisma.candle.findFirst({
+            orderBy: { open_time: 'desc' },
+            where: { symbol: 'BTCUSDT' }
+        });
 
-        console.log('[CORE] Bot is running. Press Ctrl+C to stop.');
+        if (!candle) return;
+
+        const price = new Decimal(candle.close);
+        console.log(`[CYCLE] Current Price: $${price}`);
+
+        // 4. Policy Check
+        // Example: Check if we should buy
+        const openBuys = await prisma.order.count({
+            where: { side: 'BUY', status: 'NEW' }
+        });
+
+        const canBuy = await policy.canPlaceBuyOrder(0, openBuys); // Exposure mock 0 for now
+
+        // 5. Decision Execution (Dry Run vs Live)
+        const isDryRun = settings.dry_run || config.MODE !== BotMode.LIVE;
+
+        if (canBuy) {
+            console.log('[DECISION] Opportunity identified. Attempting Buy...');
+
+            const buyPrice = price.mul(0.995); // -0.5%
+            const qty = new Decimal(0.001);
+
+            if (isDryRun) {
+                console.log(`[DRY-RUN] Would BUY ${qty} BTC @ ${buyPrice}`);
+
+                // Log decision to Audit
+                await prisma.auditLog.create({
+                    data: {
+                        action: 'decision.buy_simulated',
+                        actor_type: 'bot',
+                        env: config.MODE,
+                        reason: 'Heuristic dip detected',
+                        diff_json: { price: buyPrice.toNumber(), qty: qty.toNumber() }
+                    }
+                });
+
+            } else {
+                // Real Execution
+                try {
+                    // const order = await binance.placeLimitBuy('BTCUSDT', qty, buyPrice, `ABTC_LIVE_${Date.now()}`);
+                    // console.log('[EXECUTION] Order Placed:', order.orderId);
+                } catch (e) {
+                    console.error('[EXECUTION] Failed:', e);
+                }
+            }
+        } else {
+            console.log('[DECISION] Holding. (Policy denied or no signal)');
+        }
 
     } catch (error) {
-        console.error('[FATAL] Bot failed to start:', error);
-        process.exit(1);
+        console.error('[CYCLE] Error:', error);
     }
 }
 
-main();
+async function main() {
+    console.log('-------------------------------------------');
+    console.log(` TAI BOT SYSTEM STARTING - ${config.MODE}`);
+    console.log('-------------------------------------------');
 
-// Handle graceful shutdown
-process.on('SIGINT', async () => {
-    console.log('\n[SHUTDOWN] SQL Connection closing...');
-    await prisma.$disconnect();
-    console.log('[SHUTDOWN] Bye.');
-    process.exit(0);
-});
+    // Create default settings if needed
+    const count = await prisma.globalSettings.count();
+    if (count === 0) {
+        await prisma.globalSettings.create({
+            data: { trading_enabled: true, dry_run: true }
+        });
+        console.log('[INIT] Default settings created.');
+    }
+
+    // Initial Run
+    await runCycle();
+
+    // Schedule Loop (every 15m or 1m depending on needs)
+    setInterval(runCycle, 60 * 1000);
+
+    console.log('[CORE] Loop started.');
+}
+
+main();
