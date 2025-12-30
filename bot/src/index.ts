@@ -7,9 +7,9 @@ import { PolicyEngine } from './core/policy'; // I need to move this or copy cod
 import { Decimal } from 'decimal.js';
 
 // Re-instantiate PolicyEngine here or ensure import works
-const policy = new PolicyEngine(prisma);
+export const policy = new PolicyEngine(prisma);
 
-async function reconcileState() {
+export async function reconcileState() {
     console.log('[CORE] Reconciling State...');
     const symbol = 'BTCUSDT';
 
@@ -80,7 +80,7 @@ async function reconcileState() {
     }
 }
 
-async function runCycle() {
+export async function runCycle() {
     const cycleId = `cycle_${Date.now()}`;
     console.log(`[CYCLE] Starting ${cycleId}...`);
 
@@ -177,27 +177,28 @@ async function runCycle() {
     }
 }
 
-async function main() {
-    console.log('-------------------------------------------');
-    console.log(` TAI BOT SYSTEM STARTING - ${config.MODE}`);
-    console.log('-------------------------------------------');
+if (require.main === module) {
+    async function main() {
+        console.log('-------------------------------------------');
+        console.log(` TAI BOT SYSTEM STARTING - ${config.MODE}`);
+        console.log('-------------------------------------------');
 
-    // Create default settings if needed
-    const count = await prisma.globalSettings.count();
-    if (count === 0) {
-        await prisma.globalSettings.create({
-            data: { trading_enabled: true, dry_run: true }
-        });
-        console.log('[INIT] Default settings created.');
+        // Create default settings if needed
+        const count = await prisma.globalSettings.count();
+        if (count === 0) {
+            await prisma.globalSettings.create({
+                data: { trading_enabled: true, dry_run: true }
+            });
+            console.log('[INIT] Default settings created.');
+        }
+
+        // Initial Run
+        await runCycle();
+
+        // Schedule Loop (every 15m or 1m depending on needs)
+        setInterval(runCycle, 60 * 1000);
+
+        console.log('[CORE] Loop started.');
     }
-
-    // Initial Run
-    await runCycle();
-
-    // Schedule Loop (every 15m or 1m depending on needs)
-    setInterval(runCycle, 60 * 1000);
-
-    console.log('[CORE] Loop started.');
+    main();
 }
-
-main();

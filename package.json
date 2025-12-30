@@ -11,6 +11,7 @@
     "start:bot": "node dist-bot/index.js",
     "bot:dev": "ts-node bot/src/index.ts",
     "bot:smoke:binance": "ts-node bot/src/smoke.ts",
+    "bot:test:idempotency": "ts-node bot/src/test-idempotency.ts",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate deploy"
   },

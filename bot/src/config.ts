@@ -23,6 +23,7 @@ interface BotConfig {
 
     // Trading Mode
     MODE: BotMode;
+    DRY_RUN: boolean;
 
     // Binance
     BINANCE: {
@@ -72,6 +73,7 @@ export const config: BotConfig = {
     OPENAI_API_KEY: getEnv('OPENAI_API_KEY'),
 
     MODE: mode,
+    DRY_RUN: process.env.DRY_RUN === 'true', // Defaults to false if not set
 
     BINANCE: {
         // Allows override, but sets clear defaults based on docs if not provided (though README says provide them)
