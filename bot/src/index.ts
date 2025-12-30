@@ -9,13 +9,96 @@ import { Decimal } from 'decimal.js';
 // Re-instantiate PolicyEngine here or ensure import works
 const policy = new PolicyEngine(prisma);
 
+async function reconcileState() {
+    console.log('[CORE] Reconciling State...');
+    const symbol = 'BTCUSDT';
+
+    try {
+        // 1. Fetch Open Orders from Binance
+        const openOrders = await binance.getOpenOrders(symbol);
+
+        // 2. Fetch Open Orders from DB
+        const dbOpenOrders = await prisma.order.findMany({
+            where: { status: { in: ['NEW', 'PARTIALLY_FILLED'] } }
+        });
+
+        const binanceIds = new Set(openOrders.map((o: any) => o.clientOrderId));
+
+        // 3. Mark Missing DB Orders as CANCELED/FILLED (Sync)
+        // If DB says OPEN but Binance doesn't have it -> it was filled or canceled externally/during downtime
+        for (const dbOrder of dbOpenOrders) {
+            if (!binanceIds.has(dbOrder.client_order_id)) {
+                console.log(`[RECONCILE] Order ${dbOrder.client_order_id} missing on exchange. Checking status...`);
+                try {
+                    const check = await binance.getOrder(symbol, undefined, dbOrder.client_order_id);
+                    await prisma.order.update({
+                        where: { id: dbOrder.id },
+                        data: {
+                            status: check.status,
+                            executed_qty: new Decimal(check.executedQty),
+                            executed_quote_qty: new Decimal(check.cumQuoteQty)
+                        }
+                    });
+                } catch (e) {
+                    console.warn(`[RECONCILE] Could not fetch order ${dbOrder.client_order_id}. Assuming CANCELED/LOST.`);
+                    await prisma.order.update({ where: { id: dbOrder.id }, data: { status: 'CANCELED' } });
+                }
+            }
+        }
+
+        // 4. Ingest Unknown Orders (if prefix matches this bot env)
+        const prefix = `ABTC_${config.MODE === BotMode.TESTNET ? 'TEST' : 'LIVE'}`;
+        for (const o of openOrders) {
+            if (o.clientOrderId.startsWith(prefix)) {
+                const exists = await prisma.order.findUnique({ where: { client_order_id: o.clientOrderId } });
+                if (!exists) {
+                    console.log(`[RECONCILE] Found orphaned order ${o.clientOrderId}. Importing...`);
+                    // Import logic
+                    await prisma.order.create({
+                        data: {
+                            client_order_id: o.clientOrderId,
+                            exchange_order_id: o.orderId.toString(),
+                            env: config.MODE,
+                            side: o.side,
+                            type: o.type,
+                            status: o.status,
+                            price: new Decimal(o.price),
+                            orig_qty: new Decimal(o.origQty),
+                            executed_qty: new Decimal(o.executedQty),
+                            fee_asset: 'UNKNOWN' // Will be filled on trade event
+                        }
+                    });
+                }
+            }
+        }
+
+        console.log('[CORE] Reconciliation Complete.');
+        return true;
+    } catch (e) {
+        console.error('[CORE] Reconciliation Failed:', e);
+        return false;
+    }
+}
+
 async function runCycle() {
     const cycleId = `cycle_${Date.now()}`;
     console.log(`[CYCLE] Starting ${cycleId}...`);
 
     try {
+        // 0. Reconcile First (Critical for Idempotency)
+        const reconciled = await reconcileState();
+        if (!reconciled) {
+            console.warn('[CYCLE] Skipping Cycle due to Reconciliation Failure.');
+            return;
+        }
+
         // 1. Sync Data
-        await market.syncCandles();
+        await market.syncCandles('BTCUSDT', '15m', 1); // Incremental sync
+        // ... rest of logic
+
+        // 4. Policy Check with existing orders
+        // Idempotency: count active orders for TODAY or Cycle
+        // ...
         await market.captureDailySnapshot();
         await stats.refreshFeeStats();
 
@@ -71,6 +154,7 @@ async function runCycle() {
                         actor_type: 'bot',
                         env: config.MODE,
                         reason: 'Heuristic dip detected',
+                        entity_type: 'decision', // Corrected
                         diff_json: { price: buyPrice.toNumber(), qty: qty.toNumber() }
                     }
                 });
