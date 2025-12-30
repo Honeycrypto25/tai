@@ -18,11 +18,48 @@ export class StatsService {
 
         // 2. Extract rates
         const rates: number[] = [];
+
+        // Cache for fee asset prices (BNBUSDT, BTCUSDT) to avoid repeated API calls in loop
+        // In production we might fetch once per batch
+        let bnbPrice: Decimal | null = null;
+        let btcPrice: Decimal | null = null;
+
+        // We'll just fetch current prices once for estimation if historical rate unavailable
+        // Ideally we use price at time of trade, but current approx is standard for "current stats"
+        try {
+            const { binance } = require('./binance'); // Circular dependency avoidance or lazy load
+            bnbPrice = await binance.getTickerPrice('BNBUSDT');
+            btcPrice = await binance.getTickerPrice('BTCUSDT');
+        } catch (e) { console.warn('Could not fetch fee asset prices'); }
+
         for (const o of orders) {
-            // fee_rate is already stored, but let's recalculate/verify if needed
-            // Default to stored if available
+            let rate = 0;
+
+            // Priority 1: Use stored fee_rate if already calc
             if (o.fee_rate && !o.fee_rate.equals(0)) {
                 rates.push(o.fee_rate.toNumber());
+                continue;
+            }
+
+            // Priority 2: Calculate from raw fee_amount + fee_asset
+            if (o.fee_amount && o.fee_asset && !o.executed_quote_qty.equals(0)) {
+                let feeUsdt = new Decimal(0);
+
+                if (o.fee_asset === 'USDT') {
+                    feeUsdt = new Decimal(o.fee_amount);
+                } else if (o.fee_asset === 'BNB' && bnbPrice) {
+                    feeUsdt = new Decimal(o.fee_amount).mul(bnbPrice);
+                } else if (o.fee_asset === 'BTC' && btcPrice) {
+                    feeUsdt = new Decimal(o.fee_amount).mul(btcPrice);
+                }
+
+                if (!feeUsdt.isZero()) {
+                    rate = feeUsdt.div(o.executed_quote_qty).toNumber();
+                    rates.push(rate);
+
+                    // Optional: Self-heal DB
+                    // await prisma.order.update({ where: { id: o.id }, data: { fee_usdt: feeUsdt, fee_rate: rate }});
+                }
             }
         }
 
@@ -35,9 +72,21 @@ export class StatsService {
 
         // 4. Update Daily Snapshot (for today)
         const today = new Date().toISOString().split('T')[0];
-        await prisma.dailySnapshots.updateMany({
+
+        // Use upsert instead of updateMany to ensure record exists
+        await prisma.dailySnapshots.upsert({
             where: { date: today },
-            data: {
+            create: {
+                date: today,
+                p50_fee_rate: p50,
+                p90_fee_rate: p90,
+                btc_balance: 0,
+                usdt_balance: 0,
+                equity_usdt: 0,
+                open_buys_count: 0,
+                exposure_pct: 0
+            },
+            update: {
                 p50_fee_rate: p50,
                 p90_fee_rate: p90
             }

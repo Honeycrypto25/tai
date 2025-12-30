@@ -75,6 +75,16 @@ export class BinanceService {
 
     // --- Private API (Authenticated) ---
 
+    public async getTickerPrice(symbol: string): Promise<Decimal> {
+        try {
+            const res = await axios.get(`${this.baseURL}/api/v3/ticker/price?symbol=${symbol}`);
+            return new Decimal(res.data.price);
+        } catch (e) {
+            // Fallback
+            return new Decimal(0);
+        }
+    }
+
     public async getAccountInfo() {
         return this.signedRequest('GET', '/api/v3/account');
     }

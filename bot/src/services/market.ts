@@ -4,51 +4,74 @@ import { Decimal } from 'decimal.js';
 
 export class MarketDataService {
 
-    public async syncCandles(symbol: string = 'BTCUSDT', interval: string = '15m') {
-        console.log(`[MARKET] Syncing ${symbol} ${interval}...`);
+    public async syncCandles(symbol: string = 'BTCUSDT', interval: string = '15m', backfillDays: number = 30) {
+        console.log(`[MARKET] Syncing ${symbol} ${interval} (Backfill: ${backfillDays} days)...`);
 
-        // Fetch last 1000 candles
-        const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=1000`;
-        const res = await axios.get(url);
-        const klines = res.data;
-
-        let createdCount = 0;
-
-        // Prepare transaction
-        const ops = klines.map((k: any[]) => {
-            const openTime = new Date(k[0]);
-            return prisma.candle.upsert({
-                where: {
-                    open_time: openTime, // Upsert by ID (id is open_time)
-                },
-                update: {
-                    close: k[4],
-                    high: k[2],
-                    low: k[3],
-                    volume: k[5],
-                    quote_volume: k[7],
-                    trades_count: k[8],
-                    close_time: new Date(k[6]),
-                },
-                create: {
-                    open_time: openTime,
-                    symbol,
-                    interval,
-                    open: k[1],
-                    high: k[2],
-                    low: k[3],
-                    close: k[4],
-                    volume: k[5],
-                    quote_volume: k[7],
-                    close_time: new Date(k[6]),
-                    trades_count: k[8]
-                }
-            });
+        // 1. Check coverage
+        const lastCandle = await prisma.candle.findFirst({
+            where: { symbol, interval },
+            orderBy: { open_time: 'desc' }
         });
 
-        // Chunk execution for perf if large, but 1000 is okay for Postgres usually
-        await prisma.$transaction(ops);
-        console.log(`[MARKET] Synced ${ops.length} candles.`);
+        const now = Date.now();
+        let startTime: number;
+
+        if (lastCandle) {
+            // Continue from last close
+            startTime = lastCandle.close_time.getTime();
+            console.log(`[MARKET] Found existing data. Resuming from ${lastCandle.close_time.toISOString()}`);
+        } else {
+            // Full backfill
+            startTime = now - (backfillDays * 24 * 60 * 60 * 1000);
+            console.log(`[MARKET] No data found. Starting full backfill from ${new Date(startTime).toISOString()}`);
+        }
+
+        // Binance max limit is 1000. Loop until current.
+        let currentStart = startTime;
+        let totalSynced = 0;
+
+        while (currentStart < now) {
+            try {
+                const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=1000&startTime=${currentStart}`;
+                const res = await axios.get(url);
+                const klines = res.data;
+
+                if (!klines || klines.length === 0) break;
+
+                const ops = klines.map((k: any[]) => {
+                    const openTime = new Date(k[0]);
+                    // Only upsert if newer, avoiding duplicates at edges
+                    return prisma.candle.upsert({
+                        where: { open_time: openTime },
+                        update: {
+                            close: k[4], high: k[2], low: k[3], volume: k[5], quote_volume: k[7], trades_count: k[8], close_time: new Date(k[6]),
+                        },
+                        create: {
+                            open_time: openTime, symbol, interval, open: k[1], high: k[2], low: k[3], close: k[4], volume: k[5], quote_volume: k[7], close_time: new Date(k[6]), trades_count: k[8]
+                        }
+                    });
+                });
+
+                await prisma.$transaction(ops);
+                totalSynced += ops.length;
+
+                // Update pointer
+                const lastClose = klines[klines.length - 1][6];
+                currentStart = lastClose + 1;
+
+                console.log(`[MARKET] Synced batch. Total: ${totalSynced}. Last: ${new Date(lastClose).toISOString()}`);
+
+                // Break if caught up (last candle close is near now)
+                if (now - lastClose < 60000 * 15) break;
+
+                await new Promise(r => setTimeout(r, 200)); // Rate limit polite
+
+            } catch (e) {
+                console.error('[MARKET] Sync error:', e);
+                break;
+            }
+        }
+        console.log(`[MARKET] Sync Complete. Total: ${totalSynced}`);
     }
 
     public async captureDailySnapshot() {
