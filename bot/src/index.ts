@@ -162,10 +162,36 @@ export async function runCycle() {
             } else {
                 // Real Execution
                 try {
-                    // const order = await binance.placeLimitBuy('BTCUSDT', qty, buyPrice, `ABTC_LIVE_${Date.now()}`);
-                    // console.log('[EXECUTION] Order Placed:', order.orderId);
-                } catch (e) {
-                    console.error('[EXECUTION] Failed:', e);
+                    console.log(`[ORDER] Placing BUY Order... Qty: ${qty} Price: ${buyPrice}`);
+
+                    const clientOrderId = `ABTC_${config.MODE === BotMode.TESTNET ? 'TEST' : 'LIVE'}_${Date.now()}`;
+                    const order = await binance.placeLimitBuy('BTCUSDT', qty, buyPrice, clientOrderId);
+
+                    console.log('[EXECUTION] Order Placed Successfully:', order.orderId);
+
+                    // Log to DB immediately (Reconciliation will double check later)
+                    await prisma.order.create({
+                        data: {
+                            client_order_id: clientOrderId,
+                            exchange_order_id: order.orderId.toString(),
+                            env: config.MODE,
+                            side: 'BUY',
+                            type: 'LIMIT',
+                            status: order.status || 'NEW',
+                            price: buyPrice,
+                            orig_qty: qty,
+                            executed_qty: new Decimal(order.executedQty || 0),
+                            executed_quote_qty: new Decimal(order.cumQuoteQty || 0),
+                            fee_asset: 'UNKNOWN' // Will be filled on fill
+                        }
+                    });
+                    console.log(`[DB] Order Created in DB: ${clientOrderId}`);
+
+                } catch (e: any) {
+                    console.error('[EXECUTION] Failed to place order:', e.message);
+                    if (e.response) {
+                        console.error('[EXECUTION] API Response:', JSON.stringify(e.response.data));
+                    }
                 }
             }
         } else {
