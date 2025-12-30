@@ -23,6 +23,7 @@ async function main() {
                 action: 'settings.update',
                 actor_type: 'user',
                 env: 'live',
+                entity_type: 'settings',
                 before_json: { max_open_buys: 2 },
                 after_json: { max_open_buys: 4 },
                 diff_json: { max_open_buys: [2, 4] },
