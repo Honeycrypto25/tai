@@ -1,0 +1,187 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("NEON_DATABASE_URL")
+}
+
+// ----------------------------------------------------------------------
+// 1. CONFIGURATION & AUDIT (MUST)
+// ----------------------------------------------------------------------
+
+model GlobalSettings {
+  id                    Int      @id @default(1)
+  updated_at            DateTime @updatedAt
+  
+  // Ramp-up / Safety Params
+  trading_enabled       Boolean  @default(false)
+  dry_run               Boolean  @default(true)
+  bot_mode              String   @default("live") // live, testnet, paper
+  
+  max_open_buys         Int      @default(2)
+  max_daily_sells       Int      @default(1)
+  
+  target_sell_usdt      Decimal  @default(20.0) // Minimal sell size
+  max_usdt_exposure_pct Decimal  @default(10.0)
+  max_sell_pct_of_btc   Decimal  @default(5.0)
+  
+  safety_buffer         Decimal  @default(0.15) // % fee buffer extra
+  min_discount_net_fees Decimal  @default(0.6)  // fallback floor
+
+  @@map("global_settings")
+}
+
+model AuditLog {
+  id              String   @id @default(uuid())
+  ts_utc          DateTime @default(now())
+  
+  env             String   // live, testnet, paper
+  actor_type      String   // user, bot, ai, system
+  actor_id        String?  // e.g. 'admin', 'bot_v1'
+  
+  action          String   // settings.update, model.activate, order.cancel, order.reprice, guardrail.trigger
+  entity_type     String   // settings, model, order, policy, cycle
+  entity_id       String?
+  
+  before_json     Json?    // Snapshot before change
+  after_json      Json?    // Snapshot after change
+  diff_json       Json?    // Highlighted diff
+  
+  reason          String?
+  reason_codes    String[] // e.g. ["HIGH_VOLATILITY", "FEE_SPIKE"]
+  
+  related_decision_id String?
+  related_cycle_id    String?
+  related_ai_report_id String?
+
+  @@index([ts_utc])
+  @@index([action])
+  @@index([entity_type, entity_id])
+  @@map("audit_log")
+}
+
+// ----------------------------------------------------------------------
+// 2. TRADING DATA
+// ----------------------------------------------------------------------
+
+model Cycle {
+  id              String   @id @default(uuid())
+  status          String   // OPEN, CLOSED, STUCK
+  env             String
+  
+  start_ts        DateTime @default(now())
+  end_ts          DateTime?
+  
+  sell_order_id   String?
+  sell_price      Decimal?
+  sell_qty        Decimal?
+  sell_usdt       Decimal?
+  
+  buy_orders      Order[]
+  
+  total_btc_net   Decimal? // BTC_end - BTC_start (after fees)
+  total_usdt_pnl  Decimal? 
+  
+  is_negative_cycle Boolean @default(false)
+
+  @@map("cycles")
+}
+
+model Order {
+  id              String   @id @default(uuid())
+  client_order_id String   @unique
+  exchange_order_id String? // From Binance
+  
+  cycle_id        String?
+  cycle           Cycle?   @relation(fields: [cycle_id], references: [id])
+  
+  env             String
+  side            String   // BUY, SELL
+  type            String   // LIMIT, MARKET
+  status          String   // NEW, PARTIALLY_FILLED, FILLED, CANCELED, REJECTED, EXPIRED
+  
+  created_at      DateTime @default(now())
+  updated_at      DateTime @updatedAt
+  
+  price           Decimal
+  orig_qty        Decimal
+  executed_qty    Decimal  @default(0)
+  executed_quote_qty Decimal @default(0) // USDT volume
+  
+  fee_usdt        Decimal  @default(0)
+  fee_asset       String?
+  
+  is_anchor       Boolean  @default(false) // First buy in ladder
+  ladder_level    Int?     // 1 to 6
+  
+  @@index([status])
+  @@map("orders")
+}
+
+// ----------------------------------------------------------------------
+// 3. AI & ML ARTIFACTS
+// ----------------------------------------------------------------------
+
+model AiReport {
+  id              String   @id @default(uuid())
+  generated_at    DateTime @default(now())
+  type            String   // DAILY_DECISION, ANOMALY, MONTHLY_REVIEW, PREDICTION_SCORECARD
+  
+  content_text    String   @db.Text
+  content_json    Json?    // Structured data
+  
+  model_used      String   // gpt-4-turbo, etc.
+  tokens_used     Int?
+
+  @@map("ai_reports")
+}
+
+model Prediction {
+  id              String   @id @default(uuid())
+  created_at      DateTime @default(now())
+  
+  target_timeframe String  // 24h, 48h, 72h
+  target_drop_pct  Decimal // 0.6, 0.8, ...
+  
+  probability      Decimal // 0.0 to 1.0
+  
+  model_version    String
+  
+  actual_outcome   Boolean? // Populated later
+  verified_at      DateTime?
+
+  @@map("predictions")
+}
+
+model ModelRegistry {
+  version          String   @id
+  created_at       DateTime @default(now())
+  
+  r2_path          String
+  metrics_json     Json     // validation scores
+  
+  is_active        Boolean  @default(false)
+  
+  @@map("model_registry")
+}
+
+model DailySnapshots {
+  date             String   @id // YYYY-MM-DD
+  
+  btc_balance      Decimal
+  usdt_balance     Decimal
+  equity_usdt      Decimal
+  
+  open_buys_count  Int
+  exposure_pct     Decimal
+  
+  p50_fee_rate     Decimal
+  p90_fee_rate     Decimal
+  
+  @@map("daily_snapshots")
+}

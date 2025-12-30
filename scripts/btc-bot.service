@@ -1,0 +1,17 @@
+[Unit]
+Description=TAI Bot Service (Node.js)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/tai
+ExecStart=/usr/bin/npm run start:bot
+Restart=always
+RestartSec=10
+Environment=NODE_ENV=production
+# Environment variables should be loaded from .env content or specified here if preferred
+# But our bot loads dotenv internally, so it's fine.
+
+[Install]
+WantedBy=multi-user.target

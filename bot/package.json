@@ -1,0 +1,19 @@
+{
+    "name": "tai-bot",
+    "version": "1.0.0",
+    "description": "Trading AI Bot Runtime",
+    "main": "dist/index.js",
+    "scripts": {
+        "build": "tsc -p tsconfig.json",
+        "start": "node ../dist-bot/index.js",
+        "dev": "ts-node src/index.ts"
+    },
+    "dependencies": {
+        "axios": "^1.7.0",
+        "dotenv": "^16.4.0",
+        "decimal.js": "^10.4.3"
+    },
+    "devDependencies": {
+        "@types/node": "^20.11.0"
+    }
+}
