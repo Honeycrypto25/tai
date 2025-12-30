@@ -177,28 +177,34 @@ export async function runCycle() {
     }
 }
 
+// Main Execution Check
+// In compiled JS, require.main === module might behave differently or be undefined in some bundlers.
+// However, since we run this file directly via `node dist-bot/index.js`, we can just call main().
+// We wrap it in a function to avoid top-level await issues if targeting older node.
+
 if (require.main === module) {
-    async function main() {
-        console.log('-------------------------------------------');
-        console.log(` TAI BOT SYSTEM STARTING - ${config.MODE}`);
-        console.log('-------------------------------------------');
-
-        // Create default settings if needed
-        const count = await prisma.globalSettings.count();
-        if (count === 0) {
-            await prisma.globalSettings.create({
-                data: { trading_enabled: true, dry_run: true }
-            });
-            console.log('[INIT] Default settings created.');
-        }
-
-        // Initial Run
-        await runCycle();
-
-        // Schedule Loop (every 15m or 1m depending on needs)
-        setInterval(runCycle, 60 * 1000);
-
-        console.log('[CORE] Loop started.');
-    }
     main();
+}
+
+async function main() {
+    console.log('-------------------------------------------');
+    console.log(` TAI BOT SYSTEM STARTING - ${config.MODE}`);
+    console.log('-------------------------------------------');
+
+    // Create default settings if needed
+    const count = await prisma.globalSettings.count();
+    if (count === 0) {
+        await prisma.globalSettings.create({
+            data: { trading_enabled: true, dry_run: true }
+        });
+        console.log('[INIT] Default settings created.');
+    }
+
+    // Initial Run
+    await runCycle();
+
+    // Schedule Loop (every 15m or 1m depending on needs)
+    setInterval(runCycle, 60 * 1000);
+
+    console.log('[CORE] Loop started.');
 }
