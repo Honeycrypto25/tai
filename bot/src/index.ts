@@ -162,6 +162,23 @@ export async function runCycle() {
             } else {
                 // Real Execution
                 try {
+                    // 1. Balance Check Requirement
+                    const account = await binance.getAccountInfo();
+                    const usdtBalance = account.balances.find((b: any) => b.asset === 'USDT');
+                    const freeUsdt = new Decimal(usdtBalance?.free || 0);
+                    const lockedUsdt = new Decimal(usdtBalance?.locked || 0);
+
+                    const cost = buyPrice.mul(qty);
+                    const required = cost.mul(1.002); // +0.2% buffer for fees/slippage
+
+                    console.log(`[BALANCE] USDT Free: ${freeUsdt} | Locked: ${lockedUsdt} | Required: ${required}`);
+
+                    if (freeUsdt.lt(required)) {
+                        console.warn(`[SKIP] Insufficient USDT. Need ${required}, have ${freeUsdt}.`);
+                        return;
+                    }
+
+                    // 2. Place Order
                     console.log(`[ORDER] Placing BUY Order... Qty: ${qty} Price: ${buyPrice}`);
 
                     const clientOrderId = `ABTC_${config.MODE === BotMode.TESTNET ? 'TEST' : 'LIVE'}_${Date.now()}`;
