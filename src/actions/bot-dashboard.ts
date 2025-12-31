@@ -176,9 +176,9 @@ export async function getBotStats(timeRange: DashboardFilter = '30d') {
             date: new Date(c.buy.created_at).toISOString().split('T')[0],
             cycleId: c.id.slice(0, 6),
             netBtc: numberSafe(c.netBtc),
-            cumBtc: numberSafe(cumBtc), // Formatting helper needed? No, pass number
+            cumBtc: cumBtc,
             pnl: numberSafe(c.pnl),
-            cumPnl: numberSafe(cumUsdt)
+            cumPnl: cumUsdt
         };
     });
 
