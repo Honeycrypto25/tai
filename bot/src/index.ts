@@ -163,13 +163,30 @@ export async function runCycle() {
 
         const priceTick = await binance.getTickerPrice('BTCUSDT');
         const currentPrice = toDec(priceTick);
+        // Filters Safe Load
+        let filters = binance.getCachedFilters('BTCUSDT');
+        if (!filters) {
+            try {
+                await binance.getExchangeInfo('BTCUSDT');
+                filters = binance.getCachedFilters('BTCUSDT');
+            } catch (e) {
+                console.error('[CORE] Failed to fetch exchange info for filters:', e);
+                return;
+            }
+        }
 
-        const filters = binance.getCachedFilters('BTCUSDT');
-        let stepSize = new Decimal('0.00001');
-        let minNotional = new Decimal(10);
+        let stepSize = new Decimal(0);
+        let minNotional = new Decimal(0);
+
         if (filters) {
-            if (filters.stepSize) stepSize = toDec(filters.stepSize);
-            if (filters.minNotional) minNotional = toDec(filters.minNotional);
+            stepSize = toDec(filters.stepSize);
+            minNotional = toDec(filters.minNotional);
+        }
+
+        // Strict Fail-Safe: Block if filters invalid
+        if (stepSize.lte(0) || minNotional.lte(0)) {
+            console.error(`[FILTERS] Missing/Invalid filters for BTCUSDT. Step:${stepSize} MinNotional:${minNotional}. Blocking trading.`);
+            return;
         }
 
         // Calculate Equity
