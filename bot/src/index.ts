@@ -381,16 +381,22 @@ export async function runCycle() {
 
         const targetPrice = currentPrice.mul(new Decimal(1).minus(finalDiscount));
 
-        let usdtToInvest = usdtFree;
+        // Sizing: Equity / 10
+        const targetShare = new Decimal(0.10);
+        let usdtToInvest = equityUsdt.mul(targetShare);
+
+        // Min Floor (User Requirement: target_sell_usdt ~20)
+        const minSize = toDec(settings.target_sell_usdt).gt(0) ? toDec(settings.target_sell_usdt) : new Decimal(20);
+        if (usdtToInvest.lt(minSize)) usdtToInvest = minSize;
+
         const openBuysCount = await prisma.order.count({ where: { side: 'BUY', status: 'NEW', env: config.MODE } });
-        const remainingSlots = Math.max(1, settings.max_open_buys - openBuysCount);
-        usdtToInvest = usdtFree.div(remainingSlots);
 
-        if (usdtToInvest.lt(20)) usdtToInvest = new Decimal(20);
-
-        if (usdtFree.lt(usdtToInvest)) {
+        if (openBuysCount >= settings.max_open_buys) {
             buyDecision = 'SKIP';
-            buyReason = `Insufficient USDT (${usdtFree.toFixed(2)})`;
+            buyReason = `Max Open Buys Reached (${openBuysCount}/${settings.max_open_buys})`;
+        } else if (usdtFree.lt(usdtToInvest)) {
+            buyDecision = 'SKIP';
+            buyReason = `Insufficient USDT (${usdtFree.toFixed(2)}) < Required (${usdtToInvest.toFixed(2)})`;
         } else {
             const buyQtyRaw = usdtToInvest.div(targetPrice);
             const buyQty = buyQtyRaw.div(stepSize).floor().mul(stepSize);
@@ -419,6 +425,7 @@ export async function runCycle() {
 
                         const order = await binance.placeLimitBuy('BTCUSDT', buyQty, targetPrice, clientOrderId);
 
+                        console.log(`[DB] Saving Order with DiscountRate: ${finalDiscount.mul(100).toFixed(2)}%`);
                         await prisma.order.create({
                             data: {
                                 client_order_id: clientOrderId,
