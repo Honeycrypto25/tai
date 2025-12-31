@@ -168,6 +168,9 @@ export class BinanceService {
             params.timeInForce = 'GTC';
         }
 
+        // Ensure we get detailed response for quote quantity
+        params.newOrderRespType = 'RESULT';
+
         return this.signedRequest('POST', '/api/v3/order', params);
     }
 

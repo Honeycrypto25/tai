@@ -41,7 +41,7 @@ export default function CyclesTable({ cycles }: { cycles: any[] }) {
                                     {c.sell ? (
                                         <div>
                                             <span className="text-rose-400 font-mono">
-                                                ${(parseFloat(c.sell.executed_quote_qty)).toFixed(2)}
+                                                ${(parseFloat(c.sell.executed_quote_qty) || (parseFloat(c.sell.executed_qty) * parseFloat(c.sell.price))).toFixed(2)}
                                             </span>
                                             <div className="text-xs text-neutral-500">
                                                 @ ${parseFloat(c.sell.price).toFixed(0)}
@@ -53,7 +53,7 @@ export default function CyclesTable({ cycles }: { cycles: any[] }) {
                                     {c.buy ? (
                                         <div>
                                             <span className="text-emerald-400 font-mono">
-                                                ${(parseFloat(c.buy.executed_quote_qty)).toFixed(2)}
+                                                ${(parseFloat(c.buy.executed_quote_qty) || (parseFloat(c.buy.executed_qty) * parseFloat(c.buy.price))).toFixed(2)}
                                             </span>
                                             <div className="text-xs text-neutral-500">
                                                 @ ${parseFloat(c.buy.price).toFixed(0)}
