@@ -381,24 +381,44 @@ export async function runCycle() {
 
         const targetPrice = currentPrice.mul(new Decimal(1).minus(finalDiscount));
 
-        // Sizing Strategy: Equity / 10
-        const targetShare = new Decimal(0.10);
-        const rawTarget = equityUsdt.mul(targetShare);
+        // Sizing Strategy: STRICTLY Sell Proceeds (1:1 Cycle Match)
+        // User Requirement: BUY uses sell.executed_quote_qty - fees
+        const sellProceeds = latestSell.executed_quote_qty ? new Decimal(latestSell.executed_quote_qty) : new Decimal(0);
 
-        // Min Floor (User Requirement: target_sell_usdt ~20)
+        // Deduct fees (using estimated rate from stats, usually ~0.15%)
+        const feeAmount = sellProceeds.mul(estimatedFeeRate);
+        let finalUsdtSize = sellProceeds.minus(feeAmount);
+
+        // Safety: If sell proceeds are somehow 0 (e.g. data missing), fall back to min floor of 20
         const minSize = toDec(settings.target_sell_usdt).gt(0) ? toDec(settings.target_sell_usdt) : new Decimal(20);
-
-        // 1. Target with Floor
-        let finalUsdtSize = rawTarget;
-        if (finalUsdtSize.lt(minSize)) finalUsdtSize = minSize;
-
-        // 2. Cap by Available USDT (Accumulation Mode: Use what we have)
-        const isCapped = usdtFree.lt(finalUsdtSize);
-        if (isCapped) {
-            finalUsdtSize = usdtFree;
+        if (finalUsdtSize.lte(minSize)) {
+            // Only warn if we are significantly below minSize (meaning data might be wrong, or it was a tiny sell)
+            if (finalUsdtSize.lt(5)) {
+                console.warn(`[SIZING] Sell proceeds very low ($${finalUsdtSize.toFixed(2)}). Using MinFloor=$${minSize.toFixed(2)}`);
+                finalUsdtSize = minSize;
+            }
         }
 
-        console.log(`[SIZING] EquityTotal=${equityUsdt.toFixed(2)} | Target(10%)=${rawTarget.toFixed(2)} | MinFloor=${minSize.toFixed(2)} | UsdtFree=${usdtFree.toFixed(2)} | CapByFree=${isCapped} | FinalOrderUSDT=${finalUsdtSize.toFixed(2)}`);
+        // Refresh Balance if we just sold, to avoid stale "usdtFree" cap
+        let currentUsdtBalance = usdtFree;
+        if (sellDecision === 'SELL' && !settings.dry_run) {
+            console.log('[SIZING] Refreshing USDT balance after recent SELL...');
+            try {
+                const acct = await binance.getAccountInfo();
+                const u = acct.balances.find((x: any) => x.asset === 'USDT');
+                if (u) currentUsdtBalance = toDec(u.free ?? u.available);
+            } catch (e) {
+                console.error('[SIZING] Failed to refresh balance post-sell. Using stale.', e);
+            }
+        }
+
+        // Cap by Available USDT
+        const isCapped = currentUsdtBalance.lt(finalUsdtSize);
+        if (isCapped) {
+            finalUsdtSize = currentUsdtBalance;
+        }
+
+        console.log(`[SIZING] SellProceeds=$${sellProceeds.toFixed(2)} | FeeEst=$${feeAmount.toFixed(4)} | Target=$${finalUsdtSize.toFixed(2)} | Balance=$${currentUsdtBalance.toFixed(2)} | Capped=${isCapped}`);
 
         const openBuysCount = await prisma.order.count({ where: { side: 'BUY', status: 'NEW', env: config.MODE } });
 
