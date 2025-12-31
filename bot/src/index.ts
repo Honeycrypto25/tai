@@ -87,9 +87,6 @@ export async function reconcileState() {
     }
 }
 
-/**
- * Main Strategy Cycle
- */
 // Main Strategy Cycle
 export async function runCycle() {
     const cycleId = `cycle_${Date.now()}`;
@@ -163,6 +160,7 @@ export async function runCycle() {
 
         const priceTick = await binance.getTickerPrice('BTCUSDT');
         const currentPrice = toDec(priceTick);
+
         // Filters Safe Load
         let filters = binance.getCachedFilters('BTCUSDT');
         if (!filters) {
@@ -208,7 +206,7 @@ export async function runCycle() {
                 env: config.MODE,
                 executed_qty: { gt: 0 }
             },
-            orderBy: { updated_at: 'desc' }
+            orderBy: { created_at: 'desc' } // changed to created_at for strict timeline order
         });
 
         const now = Date.now();
@@ -224,7 +222,6 @@ export async function runCycle() {
         const hoursAgo = timeSinceSell / 3600000;
         let sellDecision = 'SKIP';
         let sellReason = '';
-        let sellExecutedThisCycle = false;
 
         if (timeSinceSell > ONE_DAY_MS) {
             // Check Conditions
@@ -272,7 +269,6 @@ export async function runCycle() {
                                 }
                             });
                             console.log('[EXECUTION] Sell Success.');
-                            sellExecutedThisCycle = true;
                         } catch (e: any) {
                             console.error('[EXECUTION] Sell Failed:', e.message);
                             sellDecision = 'FAIL';
@@ -281,7 +277,6 @@ export async function runCycle() {
                     } else {
                         console.log(`[DRY-RUN] Would SELL ${sellQtyRounded} BTC.`);
                         sellDecision = 'DRY_SELL';
-                        sellExecutedThisCycle = true;
                     }
                 }
             }
@@ -291,41 +286,47 @@ export async function runCycle() {
 
         console.log(`[SELL-LOGIC] TS:${lastFilledSell?.updated_at.toISOString() || 'NONE'} | Ago:${hoursAgo.toFixed(2)}h | Decision:${sellDecision} (${sellReason})`);
 
+        // Critical: Abort if Sell Failed
         if (sellDecision === 'FAIL') {
             console.error('[CYCLE] Aborting cycle because SELL failed.');
             return;
         }
 
-        // --- 2. BUY STRATEGY (Accumulation / Ladder) ---
-        // GATED: Only run if we are in the "Post-Sell Window"
-        const POST_SELL_WINDOW_MS = 60 * 60 * 1000; // 1 Hour
-        let allowBuys = false;
+        // --- 2. BUY STRATEGY (Dependent on Unpaired Sell) ---
 
-        if (sellExecutedThisCycle) {
-            allowBuys = true;
-        } else if (timeSinceSell < POST_SELL_WINDOW_MS) {
-            allowBuys = true;
-        }
-
-        if (!allowBuys) {
-            console.log(`[BUY-LOGIC] SKIP (Outside Post-Sell Window. Last sell ${hoursAgo.toFixed(2)}h ago). Waiting for next Daily Sell.`);
-            return;
-        }
-
-        // Throttling: Max 1 new BUY per hour
-        const lastNewBuy = await prisma.order.findFirst({
-            where: { side: 'BUY', status: 'NEW', env: config.MODE },
+        // 1. Get the absolute latest sell (refresh to see if we just sold)
+        // Must match criteria: FILLED and Real Qty
+        const latestSell = await prisma.order.findFirst({
+            where: {
+                side: 'SELL',
+                status: 'FILLED',
+                env: config.MODE,
+                executed_qty: { gt: 0 }
+            },
             orderBy: { created_at: 'desc' }
         });
 
-        if (lastNewBuy) {
-            const timeSinceBuy = now - lastNewBuy.created_at.getTime();
-            if (timeSinceBuy < 3600 * 1000) { // 1h
-                console.log(`[BUY-LOGIC] SKIP (Throttled: Last buy ${(timeSinceBuy / 60000).toFixed(1)} min ago).`);
-                return;
-            }
+        if (!latestSell) {
+            console.log('[BUY-LOGIC] SKIP (No SELL history found to pair with).');
+            return;
         }
 
+        // 2. Strict Pair Check: Is there ANY BUY (any status) created AFTER this sell?
+        // This enforces 1 Sell -> 1 Buy Session
+        const pairedBuy = await prisma.order.findFirst({
+            where: {
+                side: 'BUY',
+                env: config.MODE,
+                created_at: { gt: latestSell.created_at }
+            }
+        });
+
+        if (pairedBuy) {
+            console.log(`[BUY-LOGIC] SKIP (Sell ${latestSell.client_order_id} already paired with Buy ${pairedBuy.client_order_id}). Waiting for fresh SELL.`);
+            return;
+        }
+
+        // 3. Logic: Place Buy (If not paired)
         const openBuysCount = await prisma.order.count({ where: { side: 'BUY', status: 'NEW', env: config.MODE } });
 
         let buyDecision = 'SKIP';
@@ -377,7 +378,6 @@ export async function runCycle() {
 
                 const currentOpenOrders = await binance.getOpenOrders('BTCUSDT');
                 const duplicate = currentOpenOrders.find((o: any) => {
-                    // Check against actual exchange orders too, but rely on DB for 'env' logic context
                     if (o.side !== 'BUY' || o.status !== 'NEW') return false;
                     const oPrice = toDec(o.price);
                     const oQty = toDec(o.origQty);
@@ -425,7 +425,7 @@ export async function runCycle() {
     }
 }
 
-// Main Entry
+// Main Entry Wrapper
 if (require.main === module) {
     (async () => {
         console.log('-------------------------------------------');
