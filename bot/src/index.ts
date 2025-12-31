@@ -90,6 +90,7 @@ export async function reconcileState() {
 /**
  * Main Strategy Cycle
  */
+// Main Strategy Cycle
 export async function runCycle() {
     const cycleId = `cycle_${Date.now()}`;
     console.log(`[CYCLE] Starting ${cycleId}...`);
@@ -132,7 +133,6 @@ export async function runCycle() {
             return;
         }
 
-        // Robust Balance Extraction
         const getBal = (asset: string): any => {
             if (!account || !account.balances) return undefined;
             const b = account.balances.find((x: any) => x.asset === asset);
@@ -142,7 +142,6 @@ export async function runCycle() {
         const btcObj = getBal('BTC');
         const usdtObj = getBal('USDT');
 
-        // Fallback checks for 'free' vs 'available' or direct structure
         const extractFree = (obj: any): string | number | undefined => {
             if (!obj) return undefined;
             return obj.free ?? obj.available;
@@ -151,7 +150,6 @@ export async function runCycle() {
         const btcFreeRaw = extractFree(btcObj);
         const usdtFreeRaw = extractFree(usdtObj);
 
-        // Log Balances Raw for Debugging
         console.log(`[BALANCES] BTC_RAW=${JSON.stringify(btcObj)} USDT_RAW=${JSON.stringify(usdtObj)}`);
 
         if (btcFreeRaw === undefined || usdtFreeRaw === undefined) {
@@ -165,7 +163,6 @@ export async function runCycle() {
         const priceTick = await binance.getTickerPrice('BTCUSDT');
         const currentPrice = toDec(priceTick);
 
-        // Filters Safe Load
         const filters = binance.getCachedFilters('BTCUSDT');
         let stepSize = new Decimal('0.00001');
         let minNotional = new Decimal(10);
@@ -174,19 +171,16 @@ export async function runCycle() {
             if (filters.minNotional) minNotional = toDec(filters.minNotional);
         }
 
-        // Calculate Equity
         const btcLocked = toDec(btcObj?.locked || 0);
         const totalBtc = btcFree.add(btcLocked);
         const equityUsdt = usdtFree.add(totalBtc.mul(currentPrice));
-
-        // Ref for Logs (Strategy Sizing)
         const targetSellUsdtRef = equityUsdt.div(10);
 
         console.log(`[STATUS] Equity: $${equityUsdt.toFixed(2)} | BTC Free: ${btcFree} | USDT Free: $${usdtFree.toFixed(2)} | TargetSellRef: $${targetSellUsdtRef.toFixed(2)}`);
 
 
-        // --- 1. SELL STRATEGY (Daily Strict) ---
-        // Rule: Max 1 sell per 24h, based on last SELL FILLED.
+        // --- 1. SELL STRATEGY (PRIORITY) ---
+        // Must execute first. If FAIL, abort cycle.
 
         const lastFilledSell = await prisma.order.findFirst({
             where: { side: 'SELL', status: 'FILLED', env: config.MODE },
@@ -208,21 +202,15 @@ export async function runCycle() {
         let sellReason = '';
 
         if (timeSinceSell > ONE_DAY_MS) {
-
-            // Check Conditions
-            // Check for potential undefined/NaN propagation
             if (!btcFree.isFinite() || !stepSize.isFinite()) {
                 sellDecision = 'SKIP';
                 sellReason = 'Invalid/Infinite Balance or Steps';
             } else {
                 const btcToSellRaw = btcFree.div(10);
-
-                // Rounding
                 const remainder = btcToSellRaw.mod(stepSize);
                 const sellQtyRounded = btcToSellRaw.minus(remainder);
                 const estNotional = sellQtyRounded.mul(currentPrice);
 
-                // Validations
                 if (btcFree.lt(0.0005)) {
                     sellReason = `BTC Balance too low (${btcFree})`;
                 } else if (estNotional.lt(minNotional)) {
@@ -233,14 +221,12 @@ export async function runCycle() {
                     sellDecision = 'SELL';
                 }
 
-                // Execute
                 if (sellDecision === 'SELL') {
                     if (!settings.dry_run) {
                         try {
                             const clientOrderId = `ASELL_${config.MODE}_${now}`;
                             console.log(`[EXECUTION] Placing MARKET SELL for ${sellQtyRounded} BTC...`);
 
-                            // Safe check before API call
                             if (sellQtyRounded.isNaN() || !sellQtyRounded.isFinite()) {
                                 throw new Error('Calculated Sell Qty is NaN/Infinite');
                             }
@@ -271,15 +257,33 @@ export async function runCycle() {
                     }
                 }
             }
-
         } else {
             sellReason = `Last sell ${(hoursAgo).toFixed(2)}h ago (Must be > 24h)`;
         }
 
         console.log(`[SELL-LOGIC] TS:${lastFilledSell?.updated_at.toISOString() || 'NONE'} | Ago:${hoursAgo.toFixed(2)}h | Next:${nextSellAllowedAt.toISOString()} | Decision:${sellDecision} (${sellReason})`);
 
+        // Critical: Abort if Sell Failed
+        if (sellDecision === 'FAIL') {
+            console.error('[CYCLE] Aborting cycle because SELL failed.');
+            return;
+        }
 
         // --- 2. BUY STRATEGY (Accumulation / Ladder) ---
+
+        // Throttling: Check last new Buy
+        const lastNewBuy = await prisma.order.findFirst({
+            where: { side: 'BUY', status: 'NEW', env: config.MODE },
+            orderBy: { created_at: 'desc' }
+        });
+
+        if (lastNewBuy) {
+            const timeSinceBuy = now - lastNewBuy.created_at.getTime();
+            if (timeSinceBuy < 3600 * 1000) { // 1h
+                console.log(`[BUY-LOGIC] SKIP (Throttled: Last buy ${(timeSinceBuy / 60000).toFixed(1)} min ago).`);
+                return;
+            }
+        }
 
         const openBuysCount = await prisma.order.count({ where: { side: 'BUY', status: 'NEW', env: config.MODE } });
 
@@ -290,12 +294,10 @@ export async function runCycle() {
             buyDecision = 'HOLD';
             buyReason = `Max Open Buys Reached (${openBuysCount}/${settings.max_open_buys})`;
         } else {
-            // "AI" Logic: Discount Calculation
             const feeBuffer = estimatedFeeRate.mul(2);
             const minDiscountSetting = settings.min_discount_net_fees || new Decimal(0.6);
             const minRequiredDiscount = feeBuffer.add(minDiscountSetting.div(100));
 
-            // Volatility
             const candles = await prisma.candle.findMany({ where: { symbol: 'BTCUSDT', interval: '15m' }, orderBy: { open_time: 'desc' }, take: 24 });
             let atrPct = new Decimal(0.01);
             if (candles.length > 5) {
@@ -312,7 +314,6 @@ export async function runCycle() {
             const ladderDepthPct = new Decimal(0.005).mul(openBuysCount);
             let calculatedDiscount = minRequiredDiscount.add(atrPct.mul(0.5)).add(ladderDepthPct);
 
-            // Fallback
             const fallbackDiscount = minRequiredDiscount.add(new Decimal(0.005));
             if (calculatedDiscount.lt(fallbackDiscount)) {
                 calculatedDiscount = fallbackDiscount;
@@ -322,7 +323,6 @@ export async function runCycle() {
 
             const targetPrice = currentPrice.mul(new Decimal(1).minus(calculatedDiscount));
 
-            // Sizing
             const remainingSlots = Math.max(1, settings.max_open_buys - openBuysCount);
             let usdtToInvest = usdtFree.div(remainingSlots);
             if (usdtToInvest.lt(20)) usdtToInvest = new Decimal(20);
@@ -336,6 +336,7 @@ export async function runCycle() {
 
                 const currentOpenOrders = await binance.getOpenOrders('BTCUSDT');
                 const duplicate = currentOpenOrders.find((o: any) => {
+                    // Check against actual exchange orders too, but rely on DB for 'env' logic context
                     if (o.side !== 'BUY' || o.status !== 'NEW') return false;
                     const oPrice = toDec(o.price);
                     const oQty = toDec(o.origQty);
