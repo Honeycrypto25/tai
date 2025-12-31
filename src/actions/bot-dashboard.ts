@@ -25,7 +25,8 @@ export async function getBotStats(timeRange: DashboardFilter = '30d') {
             id: true, cycle_id: true, side: true, status: true,
             price: true, orig_qty: true, executed_qty: true, executed_quote_qty: true,
             fee_asset: true, fee_amount: true, fee_usdt: true,
-            created_at: true, client_order_id: true, ladder_level: true
+            created_at: true, client_order_id: true, ladder_level: true,
+            discount_rate: true // Analytics
         }
     });
 
@@ -45,6 +46,10 @@ export async function getBotStats(timeRange: DashboardFilter = '30d') {
     // BTC Accumulation Metrics
     let totalBtcAccumulated = new Decimal(0);
     let totalBtcAccumulatedToday = new Decimal(0);
+
+    // Discount Metrics
+    let totalDiscount = new Decimal(0);
+    let discountCount = 0;
 
     let wins = 0;
     let closedCyclesCount = 0;
@@ -114,26 +119,24 @@ export async function getBotStats(timeRange: DashboardFilter = '30d') {
                     // Check Buy Fees
                     if (c.buy.fee_asset === 'BTC') {
                         netBtc = netBtc.minus(new Decimal(c.buy.fee_amount || 0));
-                    } else if (c.buy.fee_asset === 'USDT' && new Decimal(c.buy.fee_amount || 0).gt(0)) {
-                        // If fee paid in USDT, it reduces USDT balance, but BTC balance is fully credited as per executed_qty?
-                        // YES. If I buy 1 BTC for 1000 USDT and pay 1 USDT fee: I get 1 BTC, I spend 1001 USDT.
-                        // So net BTC is +1. Correct.
-                        // If I buy 1 BTC for 1000 USDT and pay 0.001 BTC fee: I get 0.999 BTC, I spend 1000 USDT.
-                        // So net BTC is +0.999. Correct.
                     }
 
                     c.netBtc = netBtc;
                     totalBtcAccumulated = totalBtcAccumulated.add(netBtc);
                     totalPnL = totalPnL.add(netProfit);
 
+                    // Discount Tracking
+                    if (c.buy.discount_rate) {
+                        totalDiscount = totalDiscount.add(new Decimal(c.buy.discount_rate));
+                        discountCount++;
+                    }
+
                     const cycleEndMs = new Date(c.buy.created_at).getTime();
                     if (cycleEndMs >= startOfTodayMs) {
                         totalBtcAccumulatedToday = totalBtcAccumulatedToday.add(netBtc);
                     }
 
-                    if (netBtc.gt(0)) wins++; // Definition of win: Accumulated BTC > 0 (or use USDT PnL?) -> Strategy says Accumulation, so BTC > 0 is win.
-                    // Or stick to USDT profit for win rate? Usually correlated. Let's keep USDT profit > 0 for standard win rate.
-                    // Actually user said "profit e in BTC". Let's stick to standard PnL > 0 (which usually means BTC accumulation if price is stable/lower).
+                    if (netBtc.gt(0)) wins++;
 
                     closedCyclesCount++;
 
@@ -178,7 +181,8 @@ export async function getBotStats(timeRange: DashboardFilter = '30d') {
             netBtc: numberSafe(c.netBtc),
             cumBtc: cumBtc,
             pnl: numberSafe(c.pnl),
-            cumPnl: cumUsdt
+            cumPnl: cumUsdt,
+            discountRate: c.buy.discount_rate ? parseFloat(c.buy.discount_rate) : 0
         };
     });
 
@@ -206,6 +210,7 @@ export async function getBotStats(timeRange: DashboardFilter = '30d') {
             avgDurationDays: closedCyclesCount > 0 ? (totalDurationMs / closedCyclesCount) / (1000 * 3600 * 24) : 0,
 
             avgBtcPerCycle: closedCyclesCount > 0 ? totalBtcAccumulated.div(closedCyclesCount).toNumber() : 0,
+            avgDiscount: discountCount > 0 ? totalDiscount.div(discountCount).toNumber() : 0,
 
             openBuysCount: openBuys.length,
             openBuysVal: openBuys.reduce((acc, o) => acc.add(new Decimal(o.price?.toString() || 0).mul(o.orig_qty?.toString() || 0)), new Decimal(0)).toNumber(),

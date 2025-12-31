@@ -348,7 +348,7 @@ export async function runCycle() {
         // 4. Logic: Place Buy (Linked to Cycle)
         const feeBuffer = estimatedFeeRate.mul(2);
         const minDiscountSetting = settings.min_discount_net_fees || new Decimal(0.6);
-        const minRequiredDiscount = feeBuffer.add(minDiscountSetting.div(100));
+        const minRequiredDiscount = feeBuffer.add(minDiscountSetting.div(100)); // e.g. 0.003 + 0.006 = 0.009 (0.9%)
 
         const candles = await prisma.candle.findMany({ where: { symbol: 'BTCUSDT', interval: '15m' }, orderBy: { open_time: 'desc' }, take: 24 });
         let atrPct = new Decimal(0.01);
@@ -363,17 +363,23 @@ export async function runCycle() {
             atrPct = trSum.div(candles.length - 1).div(currentPrice);
         }
 
-        const ladderDepthPct = new Decimal(0);
-        let calculatedDiscount = minRequiredDiscount.add(atrPct.mul(0.5)).add(ladderDepthPct);
+        // --- Discount Logic ---
+        const atrDiscount = atrPct.mul(0.5);
+        const fallbackDiscount = minRequiredDiscount.add(new Decimal(0.005)); // Min + 0.5% buffer
 
-        const fallbackDiscount = minRequiredDiscount.add(new Decimal(0.005));
-        if (calculatedDiscount.lt(fallbackDiscount)) {
-            calculatedDiscount = fallbackDiscount;
+        // Strategy: Max(ATR_half, Fallback)
+        let finalDiscount = atrDiscount;
+        let decisionSource = 'ATR*0.5';
+
+        if (finalDiscount.lt(fallbackDiscount)) {
+            finalDiscount = fallbackDiscount;
+            decisionSource = 'Fallback(Min+0.5%)';
         }
 
-        console.log(`[BUY-LOGIC] FeeEst:${estimatedFeeRate.toFixed(4)}${feeEstFallback ? '(FB)' : ''} | MinReq:${minRequiredDiscount.toFixed(4)} | CalcDiscount:${calculatedDiscount.toFixed(4)}`);
+        // Logging as requested
+        console.log(`[BUY-LOGIC] DiscountFinal: ${(finalDiscount.mul(100)).toFixed(2)}% | ATRDisc: ${(atrDiscount.mul(100)).toFixed(2)}% | MinReq: ${(minRequiredDiscount.mul(100)).toFixed(2)}% | FeeEst: ${(estimatedFeeRate.mul(100)).toFixed(2)}% | Picked: ${decisionSource}`);
 
-        const targetPrice = currentPrice.mul(new Decimal(1).minus(calculatedDiscount));
+        const targetPrice = currentPrice.mul(new Decimal(1).minus(finalDiscount));
 
         let usdtToInvest = usdtFree;
         const openBuysCount = await prisma.order.count({ where: { side: 'BUY', status: 'NEW', env: config.MODE } });
@@ -419,7 +425,9 @@ export async function runCycle() {
                                 exchange_order_id: order.orderId.toString(),
                                 cycle_id: latestSell.cycle_id, // LINKED!
                                 env: config.MODE, side: 'BUY', type: 'LIMIT', status: order.status || 'NEW',
-                                price: targetPrice, orig_qty: buyQty, executed_qty: new Decimal(0), executed_quote_qty: new Decimal(0), fee_asset: 'UNKNOWN'
+                                price: targetPrice, orig_qty: buyQty, executed_qty: new Decimal(0), executed_quote_qty: new Decimal(0), fee_asset: 'UNKNOWN',
+                                // Analytics
+                                discount_rate: finalDiscount.mul(100)
                             }
                         });
                     } catch (e: any) {

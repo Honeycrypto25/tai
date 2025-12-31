@@ -122,6 +122,9 @@ model Order {
   fee_amount      Decimal  @default(0)
   fee_usdt        Decimal  @default(0) // Normalized
   fee_rate        Decimal  @default(0) // fee_usdt / executed_quote_qty
+
+  // Analytics
+  discount_rate   Decimal? // % discount used at creation (e.g. 1.25)
   
   @@index([status])
   @@map("orders")
