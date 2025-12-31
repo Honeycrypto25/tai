@@ -304,6 +304,7 @@ export async function runCycle() {
 
 
         // --- 2. BUY STRATEGY (Cycle-ID Paired) ---
+        // Requirement: Strict 1:1 cycle sizing, usage of sell proceeds, and balance refresh cap.
 
         let buyDecision = 'SKIP';
         let buyReason = '';
@@ -327,8 +328,6 @@ export async function runCycle() {
         // 2. Cycle ID Check
         if (!latestSell.cycle_id) {
             console.log(`[BUY-LOGIC] SKIP (Latest SELL ${latestSell.client_order_id} has no cycle_id. Legacy order?).`);
-            // NOTE: If you want to support legacy orders, you'd need a fallback logic here.
-            // But user requested: "BUY doar dacă există SELL FILLED cu cycle_id"
             return;
         }
 
@@ -345,10 +344,55 @@ export async function runCycle() {
             return;
         }
 
-        // 4. Logic: Place Buy (Linked to Cycle)
+        // 4. Sizing: Strict Sell Proceeds
+        const sellProceeds = toDec(latestSell.executed_quote_qty);
+        const feeUsdt = toDec(latestSell.fee_usdt);
+
+        if (!sellProceeds.isFinite() || sellProceeds.lte(0)) {
+            console.error(`[BUY-LOGIC] SKIP | Reason: Missing sell proceeds executed_quote_qty (${sellProceeds}) in SELL ${latestSell.client_order_id}`);
+            return;
+        }
+
+        // Use REAL fee if available, else estimate buffer but warn
+        let netProceeds = sellProceeds;
+        if (feeUsdt.gt(0)) {
+            netProceeds = sellProceeds.minus(feeUsdt);
+        } else {
+            // Fallback warning: we don't have fee_usdt stats, but we shouldn't stop trading.
+            console.log('[BUY-LOGIC] Warning: fee_usdt not found on SELL, using estimated safe buffer (0.2%)');
+            netProceeds = sellProceeds.mul(0.998);
+        }
+
+        const targetUsdt = netProceeds;
+
+
+        // 5. Balance Refresh: Cap by Available USDT (Mandatory Check)
+        // We refresh specifically to capture the just-settled sell proceeds.
+        let usdtFreeFresh = usdtFree;
+
+        try {
+            // Just force refresh always for safety in BUY step
+            const freshAcct = await binance.getAccountInfo();
+            const freshU = freshAcct.balances.find((x: any) => x.asset === 'USDT');
+            if (freshU) {
+                usdtFreeFresh = toDec(freshU.free ?? freshU.available);
+            }
+        } catch (e) {
+            console.error('[BUY-LOGIC] Failed to refresh balance. Using snapshot.', e);
+        }
+
+        let finalUsdtSize = targetUsdt;
+        let capReason = 'none';
+
+        if (usdtFreeFresh.lt(finalUsdtSize)) {
+            finalUsdtSize = usdtFreeFresh;
+            capReason = 'cap_by_free';
+        }
+
+        // 6. Discount & Price Logic
+        const settingsMinDisc = settings.min_discount_net_fees || new Decimal(0.6);
         const feeBuffer = estimatedFeeRate.mul(2);
-        const minDiscountSetting = settings.min_discount_net_fees || new Decimal(0.6);
-        const minRequiredDiscount = feeBuffer.add(minDiscountSetting.div(100)); // e.g. 0.003 + 0.006 = 0.009 (0.9%)
+        const minRequiredDiscount = feeBuffer.add(settingsMinDisc.div(100));
 
         const candles = await prisma.candle.findMany({ where: { symbol: 'BTCUSDT', interval: '15m' }, orderBy: { open_time: 'desc' }, take: 24 });
         let atrPct = new Decimal(0.01);
@@ -363,90 +407,36 @@ export async function runCycle() {
             atrPct = trSum.div(candles.length - 1).div(currentPrice);
         }
 
-        // --- Discount Logic ---
         const atrDiscount = atrPct.mul(0.5);
-        const fallbackDiscount = minRequiredDiscount.add(new Decimal(0.005)); // Min + 0.5% buffer
+        const fallbackDiscount = minRequiredDiscount.add(new Decimal(0.005));
 
-        // Strategy: Max(ATR_half, Fallback)
         let finalDiscount = atrDiscount;
-        let decisionSource = 'ATR*0.5';
-
-        if (finalDiscount.lt(fallbackDiscount)) {
-            finalDiscount = fallbackDiscount;
-            decisionSource = 'Fallback(Min+0.5%)';
-        }
-
-        // Logging as requested
-        console.log(`[BUY-LOGIC] DiscountFinal: ${(finalDiscount.mul(100)).toFixed(2)}% | ATRDisc: ${(atrDiscount.mul(100)).toFixed(2)}% | MinReq: ${(minRequiredDiscount.mul(100)).toFixed(2)}% | FeeEst: ${(estimatedFeeRate.mul(100)).toFixed(2)}% | Picked: ${decisionSource}`);
+        if (finalDiscount.lt(fallbackDiscount)) finalDiscount = fallbackDiscount;
 
         const targetPrice = currentPrice.mul(new Decimal(1).minus(finalDiscount));
+        const buyQtyRaw = finalUsdtSize.div(targetPrice);
+        const buyQty = buyQtyRaw.div(stepSize).floor().mul(stepSize);
 
-        // Sizing Strategy: STRICTLY Sell Proceeds (1:1 Cycle Match)
-        // User Requirement: BUY uses sell.executed_quote_qty - fees
-        const sellProceeds = latestSell.executed_quote_qty ? new Decimal(latestSell.executed_quote_qty) : new Decimal(0);
-
-        // Deduct fees (using estimated rate from stats, usually ~0.15%)
-        const feeAmount = sellProceeds.mul(estimatedFeeRate);
-        let finalUsdtSize = sellProceeds.minus(feeAmount);
-
-        // Safety: If sell proceeds are somehow 0 (e.g. data missing), fall back to min floor of 20
-        const minSize = toDec(settings.target_sell_usdt).gt(0) ? toDec(settings.target_sell_usdt) : new Decimal(20);
-        if (finalUsdtSize.lte(minSize)) {
-            // Only warn if we are significantly below minSize (meaning data might be wrong, or it was a tiny sell)
-            if (finalUsdtSize.lt(5)) {
-                console.warn(`[SIZING] Sell proceeds very low ($${finalUsdtSize.toFixed(2)}). Using MinFloor=$${minSize.toFixed(2)}`);
-                finalUsdtSize = minSize;
-            }
-        }
-
-        // Refresh Balance if we just sold, to avoid stale "usdtFree" cap
-        let currentUsdtBalance = usdtFree;
-        if (sellDecision === 'SELL' && !settings.dry_run) {
-            console.log('[SIZING] Refreshing USDT balance after recent SELL...');
-            try {
-                const acct = await binance.getAccountInfo();
-                const u = acct.balances.find((x: any) => x.asset === 'USDT');
-                if (u) currentUsdtBalance = toDec(u.free ?? u.available);
-            } catch (e) {
-                console.error('[SIZING] Failed to refresh balance post-sell. Using stale.', e);
-            }
-        }
-
-        // Cap by Available USDT
-        const isCapped = currentUsdtBalance.lt(finalUsdtSize);
-        if (isCapped) {
-            finalUsdtSize = currentUsdtBalance;
-        }
-
-        console.log(`[SIZING] SellProceeds=$${sellProceeds.toFixed(2)} | FeeEst=$${feeAmount.toFixed(4)} | Target=$${finalUsdtSize.toFixed(2)} | Balance=$${currentUsdtBalance.toFixed(2)} | Capped=${isCapped}`);
+        // 7. Unified Log
+        console.log(`[BUY-SIZING] cycle_id=${latestSell.cycle_id} | sellId=${latestSell.exchange_order_id} | sellProceeds=${sellProceeds.toFixed(2)} | feeUsdt=${feeUsdt.toFixed(4)} | netProceeds=${netProceeds.toFixed(2)} | usdtFreeFresh=${usdtFreeFresh.toFixed(2)} | finalUsdt=${finalUsdtSize.toFixed(2)} | price=${targetPrice.toFixed(2)} | qty=${buyQty} | discount=${finalDiscount.mul(100).toFixed(2)}% | cap=${capReason}`);
 
         const openBuysCount = await prisma.order.count({ where: { side: 'BUY', status: 'NEW', env: config.MODE } });
-
-        // Min Notional Check (Binance requires > 5-10 USDT)
-        // If we are capped at 19 USDT (and minFloor is 20), we should still trade if above absolute exchange min.
-        // We will assume 12 USDT is absolute safe floor for Binance.
-        const absoluteMin = new Decimal(12);
+        const absoluteMin = new Decimal(10); // Hard Binance min is 5-10
 
         if (openBuysCount >= settings.max_open_buys) {
             buyDecision = 'SKIP';
-            buyReason = `Max Open Buys Reached (${openBuysCount}/${settings.max_open_buys})`;
+            buyReason = `Max Open Buys Reached (${openBuysCount})`;
         } else if (finalUsdtSize.lt(absoluteMin)) {
             buyDecision = 'SKIP';
-            buyReason = `Order Size ${finalUsdtSize.toFixed(2)} < Absolute Min ${absoluteMin} (Too low balance)`;
+            buyReason = `Order Size ${finalUsdtSize.toFixed(2)} < Absolute Min ${absoluteMin} (Too low balance or small sell)`;
         } else {
-            const buyQtyRaw = finalUsdtSize.div(targetPrice);
-            const buyQty = buyQtyRaw.div(stepSize).floor().mul(stepSize);
-
-            // Duplicate Scan (Safety)
+            // Duplicate Scan
             const currentOpenOrders = await binance.getOpenOrders('BTCUSDT');
             const duplicate = currentOpenOrders.find((o: any) => {
                 if (o.side !== 'BUY' || o.status !== 'NEW') return false;
                 const oPrice = toDec(o.price);
-                const oQty = toDec(o.origQty);
-                // Strict check
                 const priceDelta = oPrice.minus(targetPrice).abs();
-                const qtyDeltaPct = oQty.minus(buyQty).abs().div(buyQty);
-                return (priceDelta.lt(5) && qtyDeltaPct.lt(0.05));
+                return (priceDelta.lt(5));
             });
 
             if (duplicate) {
@@ -459,9 +449,10 @@ export async function runCycle() {
                         const clientOrderId = `ABUY_${config.MODE}_${now}`;
                         console.log(`[EXECUTION] Placing LIMIT BUY @ ${targetPrice.toFixed(2)} Qty:${buyQty} (Cycle: ${latestSell.cycle_id})`);
 
+                        console.log(`[DB] Saving BUY with DiscountRate: ${finalDiscount.mul(100).toFixed(2)}% | cycle_id=${latestSell.cycle_id} | targetUsdt=${targetUsdt.toFixed(2)} | finalUsdt=${finalUsdtSize.toFixed(2)} | price=${targetPrice.toFixed(2)}`);
+
                         const order = await binance.placeLimitBuy('BTCUSDT', buyQty, targetPrice, clientOrderId);
 
-                        console.log(`[DB] Saving Order with DiscountRate: ${finalDiscount.mul(100).toFixed(2)}%`);
                         await prisma.order.create({
                             data: {
                                 client_order_id: clientOrderId,
