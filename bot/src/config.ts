@@ -13,12 +13,7 @@ export enum BotMode {
 interface BotConfig {
     // Infrastructure
     DATABASE_URL: string;
-    R2_CONFIG: {
-        ACCOUNT_ID: string;
-        ACCESS_KEY_ID: string;
-        SECRET_ACCESS_KEY: string;
-        BUCKET: string;
-    };
+    // R2 Removed as requested
     OPENAI_API_KEY: string;
 
     // Trading Mode
@@ -62,15 +57,7 @@ const apiSecret = mode === BotMode.TESTNET
 
 export const config: BotConfig = {
     DATABASE_URL: getEnv('NEON_DATABASE_URL'),
-
-    R2_CONFIG: {
-        ACCOUNT_ID: getEnv('R2_ACCOUNT_ID'),
-        ACCESS_KEY_ID: getEnv('R2_ACCESS_KEY_ID'),
-        SECRET_ACCESS_KEY: getEnv('R2_SECRET_ACCESS_KEY'),
-        BUCKET: getEnv('R2_BUCKET'),
-    },
-
-    OPENAI_API_KEY: getEnv('OPENAI_API_KEY'),
+    OPENAI_API_KEY: getEnv('OPENAI_API_KEY', false), // Optional if not using AI Service strictly
 
     MODE: mode,
     DRY_RUN: process.env.DRY_RUN === 'true', // Defaults to false if not set

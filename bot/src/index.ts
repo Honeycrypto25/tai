@@ -3,29 +3,27 @@ import { config, BotMode } from './config';
 import { market } from './services/market';
 import { stats } from './services/stats';
 import { binance } from './services/binance';
-import { PolicyEngine } from './core/policy'; // I need to move this or copy code
+import { PolicyEngine } from './core/policy';
 import { Decimal } from 'decimal.js';
 
-// Re-instantiate PolicyEngine here or ensure import works
 export const policy = new PolicyEngine(prisma);
 
+/**
+ * Helper: Reconcile Exchange vs DB Orders
+ */
 export async function reconcileState() {
     console.log('[CORE] Reconciling State...');
     const symbol = 'BTCUSDT';
 
     try {
-        // 1. Fetch Open Orders from Binance
         const openOrders = await binance.getOpenOrders(symbol);
-
-        // 2. Fetch Open Orders from DB
         const dbOpenOrders = await prisma.order.findMany({
             where: { status: { in: ['NEW', 'PARTIALLY_FILLED'] } }
         });
 
         const binanceIds = new Set(openOrders.map((o: any) => o.clientOrderId));
 
-        // 3. Mark Missing DB Orders as CANCELED/FILLED (Sync)
-        // If DB says OPEN but Binance doesn't have it -> it was filled or canceled externally/during downtime
+        // 1. Mark Missing DB Orders as CANCELED/FILLED
         for (const dbOrder of dbOpenOrders) {
             if (!binanceIds.has(dbOrder.client_order_id)) {
                 console.log(`[RECONCILE] Order ${dbOrder.client_order_id} missing on exchange. Checking status...`);
@@ -46,14 +44,13 @@ export async function reconcileState() {
             }
         }
 
-        // 4. Ingest Unknown Orders (if prefix matches this bot env)
+        // 2. Ingest Orphaned Orders (only for this env)
         const prefix = `ABTC_${config.MODE === BotMode.TESTNET ? 'TEST' : 'LIVE'}`;
         for (const o of openOrders) {
             if (o.clientOrderId.startsWith(prefix)) {
                 const exists = await prisma.order.findUnique({ where: { client_order_id: o.clientOrderId } });
                 if (!exists) {
                     console.log(`[RECONCILE] Found orphaned order ${o.clientOrderId}. Importing...`);
-                    // Import logic
                     await prisma.order.create({
                         data: {
                             client_order_id: o.clientOrderId,
@@ -65,7 +62,7 @@ export async function reconcileState() {
                             price: new Decimal(o.price),
                             orig_qty: new Decimal(o.origQty),
                             executed_qty: new Decimal(o.executedQty),
-                            fee_asset: 'UNKNOWN' // Will be filled on trade event
+                            fee_asset: 'UNKNOWN'
                         }
                     });
                 }
@@ -80,174 +77,285 @@ export async function reconcileState() {
     }
 }
 
+/**
+ * Main Strategy Cycle
+ */
 export async function runCycle() {
     const cycleId = `cycle_${Date.now()}`;
     console.log(`[CYCLE] Starting ${cycleId}...`);
 
     try {
-        // 0. Reconcile First (Critical for Idempotency)
+        // --- 0. PRE-FLIGHT ---
         const reconciled = await reconcileState();
-        if (!reconciled) {
-            console.warn('[CYCLE] Skipping Cycle due to Reconciliation Failure.');
-            return;
-        }
+        if (!reconciled) return;
 
-        // 1. Sync Data
-        await market.syncCandles('BTCUSDT', '15m', 1); // Incremental sync
-        // ... rest of logic
+        // Sync Market Data (Candles)
+        await market.syncCandles('BTCUSDT', '15m', 1);
 
-        // 4. Policy Check with existing orders
-        // Idempotency: count active orders for TODAY or Cycle
-        // ...
-        await market.captureDailySnapshot();
-        await stats.refreshFeeStats();
-
-        // 2. Fetch State
+        // Fetch Settings
         const settings = await prisma.globalSettings.findFirst();
-        if (!settings) {
-            console.warn('[CYCLE] No settings found. Skipping.');
-            return;
-        }
-
+        if (!settings) return;
         if (!settings.trading_enabled && !settings.dry_run) {
-            console.log('[CYCLE] Trading disabled via Master Switch.');
+            console.log('[CYCLE] Trading disabled & Not Dry Run.');
             return;
         }
 
-        // 3. Analyze Market (Strategy Placeholder - usually ML or Heuristic)
-        // For now, we use a simple heuristic example as "Logic Real"
-        // Fetch last candle
-        const candle = await prisma.candle.findFirst({
-            orderBy: { open_time: 'desc' },
-            where: { symbol: 'BTCUSDT' }
+        // Fetch Order Stats for Fees
+        // Count total filled orders to know if we can trust the stats
+        const filledOrderCount = await prisma.order.count({ where: { status: 'FILLED', executed_qty: { gt: 0 } } });
+        const feeStats = await stats.refreshFeeStats();
+
+        let estimatedFeeRate = new Decimal(0.0015); // Default 0.15% safe
+        let feeEstFallback = false;
+
+        if (filledOrderCount >= 20 && feeStats.p90 > 0) {
+            estimatedFeeRate = new Decimal(feeStats.p90);
+        } else {
+            feeEstFallback = true;
+        }
+
+        // Fetch Account Data
+        const account = await binance.getAccountInfo();
+        const btcBalanceObj = account.balances.find((b: any) => b.asset === 'BTC');
+        const usdtBalanceObj = account.balances.find((b: any) => b.asset === 'USDT');
+
+        const btcFree = new Decimal(btcBalanceObj?.free || 0);
+        const usdtFree = new Decimal(usdtBalanceObj?.free || 0);
+
+        // Get Price & Filters
+        const priceTick = await binance.getTickerPrice('BTCUSDT');
+        const currentPrice = new Decimal(priceTick);
+        const filters = binance.getCachedFilters('BTCUSDT');
+        let stepSize = new Decimal('0.00001');
+        let minNotional = new Decimal(10);
+        if (filters) {
+            if (filters.stepSize) stepSize = new Decimal(filters.stepSize);
+            if (filters.minNotional) minNotional = new Decimal(filters.minNotional);
+        }
+
+        // Calculate Equity (USDT)
+        const totalBtc = new Decimal(btcBalanceObj?.free || 0).add(btcBalanceObj?.locked || 0);
+        const equityUsdt = usdtFree.add(totalBtc.mul(currentPrice));
+
+        // Dynamic Target Sell USDT (Reference Only)
+        // Used to gauge "Scale" of ops, but NOT frequency.
+        const targetSellUsdtRef = equityUsdt.div(10);
+
+        console.log(`[STATUS] Equity: $${equityUsdt.toFixed(2)} | BTC Free: ${btcFree} | USDT Free: $${usdtFree.toFixed(2)} | TargetSellRef: $${targetSellUsdtRef.toFixed(2)}`);
+
+
+        // --- 1. SELL STRATEGY (Daily Strict) ---
+        // Rule: Max 1 sell per 24h, based on last SELL FILLED.
+
+        const lastFilledSell = await prisma.order.findFirst({
+            where: { side: 'SELL', status: 'FILLED', env: config.MODE },
+            orderBy: { updated_at: 'desc' }
         });
 
-        if (!candle) return;
+        const now = Date.now();
+        const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+        let timeSinceSell = ONE_DAY_MS + 1000; // Default: Ready
+        let nextSellAllowedAt = new Date(now);
 
-        const price = new Decimal(candle.close);
-        console.log(`[CYCLE] Current Price: $${price}`);
+        if (lastFilledSell) {
+            timeSinceSell = now - lastFilledSell.updated_at.getTime();
+            nextSellAllowedAt = new Date(lastFilledSell.updated_at.getTime() + ONE_DAY_MS);
+        }
 
-        // 4. Policy Check
-        // Example: Check if we should buy
-        const openBuys = await prisma.order.count({
-            where: { side: 'BUY', status: 'NEW' }
-        });
+        const hoursAgo = timeSinceSell / 3600000;
+        let sellDecision = 'SKIP';
+        let sellReason = '';
 
-        const canBuy = await policy.canPlaceBuyOrder(0, openBuys); // Exposure mock 0 for now
+        if (timeSinceSell > ONE_DAY_MS) {
 
-        // 5. Decision Execution (Dry Run vs Live)
-        const isDryRun = settings.dry_run || config.MODE !== BotMode.LIVE;
+            // Check Conditions
+            const btcToSellRaw = btcFree.div(10); // Policy: 10% of Free BTC
 
-        if (canBuy) {
-            console.log('[DECISION] Opportunity identified. Attempting Buy...');
+            // Rounding
+            const remainder = btcToSellRaw.mod(stepSize);
+            const sellQtyRounded = btcToSellRaw.minus(remainder);
+            const estNotional = sellQtyRounded.mul(currentPrice);
 
-            const buyPrice = price.mul(0.995); // -0.5%
-            const qty = new Decimal(0.001);
+            // Validations
+            if (btcFree.lt(0.0005)) {
+                sellReason = `BTC Balance too low (${btcFree})`;
+            } else if (estNotional.lt(minNotional)) {
+                sellReason = `minNotional $${estNotional.toFixed(2)} < $${minNotional}`;
+            } else if (sellQtyRounded.eq(0)) {
+                sellReason = `qty round to 0`;
+            } else {
+                sellDecision = 'SELL';
+            }
 
-            if (isDryRun) {
-                console.log(`[DRY-RUN] Would BUY ${qty} BTC @ ${buyPrice}`);
+            // Excecute
+            if (sellDecision === 'SELL') {
+                if (!settings.dry_run) {
+                    try {
+                        const clientOrderId = `ASELL_${config.MODE}_${now}`;
+                        console.log(`[EXECUTION] Placing MARKET SELL for ${sellQtyRounded} BTC...`);
+                        const order = await binance.placeMarketSell('BTCUSDT', sellQtyRounded, clientOrderId);
 
-                // Log decision to Audit
-                await prisma.auditLog.create({
-                    data: {
-                        action: 'decision.buy_simulated',
-                        actor_type: 'bot',
-                        env: config.MODE,
-                        reason: 'Heuristic dip detected',
-                        entity_type: 'decision', // Corrected
-                        diff_json: { price: buyPrice.toNumber(), qty: qty.toNumber() }
+                        await prisma.order.create({
+                            data: {
+                                client_order_id: clientOrderId,
+                                exchange_order_id: order.orderId.toString(),
+                                env: config.MODE, side: 'SELL', type: 'MARKET', status: order.status || 'FILLED',
+                                price: new Decimal(order.avgPrice || currentPrice),
+                                orig_qty: sellQtyRounded,
+                                executed_qty: new Decimal(order.executedQty),
+                                executed_quote_qty: new Decimal(order.cumQuoteQty),
+                                fee_asset: 'USDT'
+                            }
+                        });
+                        console.log('[EXECUTION] Sell Success.');
+                    } catch (e: any) {
+                        console.error('[EXECUTION] Sell Failed:', e.message);
+                        sellDecision = 'FAIL';
+                        sellReason = e.message;
                     }
+                } else {
+                    console.log(`[DRY-RUN] Would SELL ${sellQtyRounded} BTC.`);
+                    sellDecision = 'DRY_SELL';
+                }
+            }
+
+        } else {
+            sellReason = `Last sell ${(hoursAgo).toFixed(2)}h ago (Must be > 24h)`;
+        }
+
+        // REQUIRED LOG: SELL LOGIC
+        console.log(`[SELL-LOGIC] TS:${lastFilledSell?.updated_at.toISOString() || 'NONE'} | Ago:${hoursAgo.toFixed(2)}h | Next:${nextSellAllowedAt.toISOString()} | Decision:${sellDecision} (${sellReason})`);
+
+
+        // --- 2. BUY STRATEGY (Accumulation / Ladder) ---
+
+        // Count Active Buys
+        const openBuysCount = await prisma.order.count({ where: { side: 'BUY', status: 'NEW', env: config.MODE } });
+        // Consistency check: The simple count above is our truth for "slots".
+
+        let buyDecision = 'SKIP';
+        let buyReason = '';
+
+        if (openBuysCount >= settings.max_open_buys) {
+            buyDecision = 'HOLD';
+            buyReason = `Max Open Buys Reached (${openBuysCount}/${settings.max_open_buys})`;
+        } else {
+            // "AI" Logic: Discount Calculation
+            const feeBuffer = estimatedFeeRate.mul(2); // Safety roundtrip
+            const minDiscountSetting = settings.min_discount_net_fees || new Decimal(0.6);
+            const minRequiredDiscount = feeBuffer.add(minDiscountSetting.div(100));
+
+            // Volatility
+            const candles = await prisma.candle.findMany({ where: { symbol: 'BTCUSDT', interval: '15m' }, orderBy: { open_time: 'desc' }, take: 24 });
+            let atrPct = new Decimal(0.01);
+            if (candles.length > 5) {
+                let trSum = new Decimal(0);
+                for (let i = 0; i < candles.length - 1; i++) {
+                    const h = candles[i].high, l = candles[i].low, pc = candles[i + 1].close;
+                    trSum = trSum.add(Decimal.max(h.minus(l), h.minus(pc).abs(), l.minus(pc).abs()));
+                }
+                atrPct = trSum.div(candles.length - 1).div(currentPrice);
+            }
+
+            const ladderDepthPct = new Decimal(0.005).mul(openBuysCount);
+            let calculatedDiscount = minRequiredDiscount.add(atrPct.mul(0.5)).add(ladderDepthPct);
+
+            // Fallback / Cap
+            // Ensure we don't hold if formula goes weird, but we MUST respect minimums.
+            // "Fallback simplu: max(min_calc, X%)"
+            const fallbackDiscount = minRequiredDiscount.add(new Decimal(0.005)); // Min + 0.5%
+            if (calculatedDiscount.lt(fallbackDiscount)) {
+                calculatedDiscount = fallbackDiscount;
+            }
+
+            console.log(`[BUY-LOGIC] FeeEst:${estimatedFeeRate.toFixed(4)}${feeEstFallback ? '(FB)' : ''} | MinReq:${minRequiredDiscount.toFixed(4)} | CalcDiscount:${calculatedDiscount.toFixed(4)}`);
+
+            const targetPrice = currentPrice.mul(new Decimal(1).minus(calculatedDiscount));
+
+            // Sizing
+            const remainingSlots = Math.max(1, settings.max_open_buys - openBuysCount);
+            let usdtToInvest = usdtFree.div(remainingSlots);
+            if (usdtToInvest.lt(20)) usdtToInvest = new Decimal(20);
+
+            if (usdtFree.lt(usdtToInvest)) {
+                buyDecision = 'SKIP';
+                buyReason = `Insufficient USDT (${usdtFree.toFixed(2)})`;
+            } else {
+                const buyQtyRaw = usdtToInvest.div(targetPrice);
+                const buyQty = buyQtyRaw.div(stepSize).floor().mul(stepSize);
+
+                // Anti-Duplicate Guard
+                const currentOpenOrders = await binance.getOpenOrders('BTCUSDT');
+                const duplicate = currentOpenOrders.find((o: any) => {
+                    if (o.side !== 'BUY' || o.status !== 'NEW') return false;
+                    const oPrice = new Decimal(o.price);
+                    const oQty = new Decimal(o.origQty);
+
+                    const priceDelta = oPrice.minus(targetPrice).abs(); // Abs diff
+                    const qtyDeltaPct = oQty.minus(buyQty).abs().div(buyQty);
+
+                    // Duplicate if Price < $5 diff AND Qty < 5% diff
+                    return (priceDelta.lt(5) && qtyDeltaPct.lt(0.05));
                 });
 
-            } else {
-                // Real Execution
-                try {
-                    // 1. Balance Check Requirement
-                    const account = await binance.getAccountInfo();
-                    const usdtBalance = account.balances.find((b: any) => b.asset === 'USDT');
-                    const freeUsdt = new Decimal(usdtBalance?.free || 0);
-                    const lockedUsdt = new Decimal(usdtBalance?.locked || 0);
-
-                    const cost = buyPrice.mul(qty);
-                    const required = cost.mul(1.002); // +0.2% buffer for fees/slippage
-
-                    console.log(`[BALANCE] USDT Free: ${freeUsdt} | Locked: ${lockedUsdt} | Required: ${required}`);
-
-                    if (freeUsdt.lt(required)) {
-                        console.warn(`[SKIP] Insufficient USDT. Need ${required}, have ${freeUsdt}.`);
-                        return;
-                    }
-
-                    // 2. Place Order
-                    console.log(`[ORDER] Placing BUY Order... Qty: ${qty} Price: ${buyPrice}`);
-
-                    const clientOrderId = `ABTC_${config.MODE === BotMode.TESTNET ? 'TEST' : 'LIVE'}_${Date.now()}`;
-                    const order = await binance.placeLimitBuy('BTCUSDT', qty, buyPrice, clientOrderId);
-
-                    console.log('[EXECUTION] Order Placed Successfully:', order.orderId);
-
-                    // Log to DB immediately (Reconciliation will double check later)
-                    await prisma.order.create({
-                        data: {
-                            client_order_id: clientOrderId,
-                            exchange_order_id: order.orderId.toString(),
-                            env: config.MODE,
-                            side: 'BUY',
-                            type: 'LIMIT',
-                            status: order.status || 'NEW',
-                            price: buyPrice,
-                            orig_qty: qty,
-                            executed_qty: new Decimal(order.executedQty || 0),
-                            executed_quote_qty: new Decimal(order.cumQuoteQty || 0),
-                            fee_asset: 'UNKNOWN' // Will be filled on fill
+                if (duplicate) {
+                    buyDecision = 'SKIP';
+                    buyReason = `Duplicate Found: ID=${duplicate.clientOrderId} P=${duplicate.price} Q=${duplicate.origQty} vs Tgt=${targetPrice.toFixed(2)}/${buyQty}`;
+                } else {
+                    buyDecision = 'PLACE';
+                    // Execute
+                    if (!settings.dry_run) {
+                        try {
+                            const clientOrderId = `ABUY_${config.MODE}_${now}`;
+                            console.log(`[EXECUTION] Placing LIMIT BUY @ ${targetPrice.toFixed(2)} Qty:${buyQty}...`);
+                            const order = await binance.placeLimitBuy('BTCUSDT', buyQty, targetPrice, clientOrderId);
+                            await prisma.order.create({
+                                data: {
+                                    client_order_id: clientOrderId, exchange_order_id: order.orderId.toString(),
+                                    env: config.MODE, side: 'BUY', type: 'LIMIT', status: order.status || 'NEW',
+                                    price: targetPrice, orig_qty: buyQty, executed_qty: new Decimal(0), executed_quote_qty: new Decimal(0), fee_asset: 'UNKNOWN'
+                                }
+                            });
+                        } catch (e: any) {
+                            console.error('[EXECUTION] Buy Failed:', e.message);
+                            buyDecision = 'FAIL';
+                            buyReason = e.message;
                         }
-                    });
-                    console.log(`[DB] Order Created in DB: ${clientOrderId}`);
-
-                } catch (e: any) {
-                    console.error('[EXECUTION] Failed to place order:', e.message);
-                    if (e.response) {
-                        console.error('[EXECUTION] API Response:', JSON.stringify(e.response.data));
+                    } else {
+                        console.log(`[DRY-RUN] Would BUY @ ${targetPrice.toFixed(2)} Qty:${buyQty}`);
                     }
                 }
             }
-        } else {
-            console.log('[DECISION] Holding. (Policy denied or no signal)');
         }
 
-    } catch (error) {
-        console.error('[CYCLE] Error:', error);
+        console.log(`[BUY-LOGIC] Decision:${buyDecision} ${buyReason ? `| Reason: ${buyReason}` : ''}`);
+
+    } catch (e) {
+        console.error('[CYCLE] Error:', e);
     }
 }
 
-// Main Execution Check
-// In compiled JS, require.main === module might behave differently or be undefined in some bundlers.
-// However, since we run this file directly via `node dist-bot/index.js`, we can just call main().
-// We wrap it in a function to avoid top-level await issues if targeting older node.
-
+// Main Entry Wrapper
 if (require.main === module) {
-    main();
-}
+    (async () => {
+        console.log('-------------------------------------------');
+        console.log(` TAI BOT SYSTEM STARTING - ${config.MODE}`);
+        console.log('-------------------------------------------');
 
-async function main() {
-    console.log('-------------------------------------------');
-    console.log(` TAI BOT SYSTEM STARTING - ${config.MODE}`);
-    console.log('-------------------------------------------');
+        const count = await prisma.globalSettings.count();
+        if (count === 0) {
+            await prisma.globalSettings.create({
+                data: { trading_enabled: true, dry_run: true }
+            });
+            console.log('[INIT] Default settings created.');
+        }
 
-    // Create default settings if needed
-    const count = await prisma.globalSettings.count();
-    if (count === 0) {
-        await prisma.globalSettings.create({
-            data: { trading_enabled: true, dry_run: true }
-        });
-        console.log('[INIT] Default settings created.');
-    }
-
-    // Initial Run
-    await runCycle();
-
-    // Schedule Loop (every 15m or 1m depending on needs)
-    setInterval(runCycle, 60 * 1000);
-
-    console.log('[CORE] Loop started.');
+        while (true) {
+            const start = Date.now();
+            await runCycle();
+            const elapsed = Date.now() - start;
+            const delay = Math.max(1000, 60000 - elapsed);
+            await new Promise(r => setTimeout(r, delay));
+        }
+    })();
 }
