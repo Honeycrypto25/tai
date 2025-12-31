@@ -150,6 +150,7 @@ export async function runCycle() {
         const btcFreeRaw = extractFree(btcObj);
         const usdtFreeRaw = extractFree(usdtObj);
 
+        // Log Balances Raw for Debugging
         console.log(`[BALANCES] BTC_RAW=${JSON.stringify(btcObj)} USDT_RAW=${JSON.stringify(usdtObj)}`);
 
         if (btcFreeRaw === undefined || usdtFreeRaw === undefined) {
@@ -171,6 +172,7 @@ export async function runCycle() {
             if (filters.minNotional) minNotional = toDec(filters.minNotional);
         }
 
+        // Calculate Equity
         const btcLocked = toDec(btcObj?.locked || 0);
         const totalBtc = btcFree.add(btcLocked);
         const equityUsdt = usdtFree.add(totalBtc.mul(currentPrice));
@@ -180,10 +182,15 @@ export async function runCycle() {
 
 
         // --- 1. SELL STRATEGY (PRIORITY) ---
-        // Must execute first. If FAIL, abort cycle.
 
+        // Strict Query for Last Sell
         const lastFilledSell = await prisma.order.findFirst({
-            where: { side: 'SELL', status: 'FILLED', env: config.MODE },
+            where: {
+                side: 'SELL',
+                status: 'FILLED',
+                env: config.MODE,
+                executed_qty: { gt: 0 }
+            },
             orderBy: { updated_at: 'desc' }
         });
 
@@ -200,8 +207,10 @@ export async function runCycle() {
         const hoursAgo = timeSinceSell / 3600000;
         let sellDecision = 'SKIP';
         let sellReason = '';
+        let sellExecutedThisCycle = false;
 
         if (timeSinceSell > ONE_DAY_MS) {
+            // Check Conditions
             if (!btcFree.isFinite() || !stepSize.isFinite()) {
                 sellDecision = 'SKIP';
                 sellReason = 'Invalid/Infinite Balance or Steps';
@@ -246,6 +255,7 @@ export async function runCycle() {
                                 }
                             });
                             console.log('[EXECUTION] Sell Success.');
+                            sellExecutedThisCycle = true;
                         } catch (e: any) {
                             console.error('[EXECUTION] Sell Failed:', e.message);
                             sellDecision = 'FAIL';
@@ -254,24 +264,38 @@ export async function runCycle() {
                     } else {
                         console.log(`[DRY-RUN] Would SELL ${sellQtyRounded} BTC.`);
                         sellDecision = 'DRY_SELL';
+                        sellExecutedThisCycle = true;
                     }
                 }
             }
         } else {
-            sellReason = `Last sell ${(hoursAgo).toFixed(2)}h ago (Must be > 24h)`;
+            sellReason = `Last sell ${(hoursAgo).toFixed(2)}h ago (ID: ${lastFilledSell?.client_order_id})`;
         }
 
-        console.log(`[SELL-LOGIC] TS:${lastFilledSell?.updated_at.toISOString() || 'NONE'} | Ago:${hoursAgo.toFixed(2)}h | Next:${nextSellAllowedAt.toISOString()} | Decision:${sellDecision} (${sellReason})`);
+        console.log(`[SELL-LOGIC] TS:${lastFilledSell?.updated_at.toISOString() || 'NONE'} | Ago:${hoursAgo.toFixed(2)}h | Decision:${sellDecision} (${sellReason})`);
 
-        // Critical: Abort if Sell Failed
         if (sellDecision === 'FAIL') {
             console.error('[CYCLE] Aborting cycle because SELL failed.');
             return;
         }
 
         // --- 2. BUY STRATEGY (Accumulation / Ladder) ---
+        // GATED: Only run if we are in the "Post-Sell Window"
+        const POST_SELL_WINDOW_MS = 60 * 60 * 1000; // 1 Hour
+        let allowBuys = false;
 
-        // Throttling: Check last new Buy
+        if (sellExecutedThisCycle) {
+            allowBuys = true;
+        } else if (timeSinceSell < POST_SELL_WINDOW_MS) {
+            allowBuys = true;
+        }
+
+        if (!allowBuys) {
+            console.log(`[BUY-LOGIC] SKIP (Outside Post-Sell Window. Last sell ${hoursAgo.toFixed(2)}h ago). Waiting for next Daily Sell.`);
+            return;
+        }
+
+        // Throttling: Max 1 new BUY per hour
         const lastNewBuy = await prisma.order.findFirst({
             where: { side: 'BUY', status: 'NEW', env: config.MODE },
             orderBy: { created_at: 'desc' }
@@ -344,6 +368,7 @@ export async function runCycle() {
                     const priceDelta = oPrice.minus(targetPrice).abs();
                     const qtyDeltaPct = oQty.minus(buyQty).abs().div(buyQty);
 
+                    // Strict duplicate check
                     return (priceDelta.lt(5) && qtyDeltaPct.lt(0.05));
                 });
 
