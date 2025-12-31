@@ -1,12 +1,12 @@
 'use client';
 import React, { useState } from 'react';
-import { ResponsiveContainer, AreaChart, Area, XAxis, YAxis, Tooltip, CartesianGrid, BarChart, Bar } from 'recharts';
+import { ResponsiveContainer, AreaChart, Area, XAxis, YAxis, Tooltip, CartesianGrid, BarChart, Bar, ReferenceLine } from 'recharts';
 
 export default function ChartsSection({ data }: { data: any }) {
     // data.daily -> Array of { date, netBtc, count }
-    // data.cumulative -> Array of { date, netBtc, cumBtc, ... }
+    // data.cumulative -> Array of { date, netBtc, cumBtc, discountRate, ... }
 
-    const [activeTab, setActiveTab] = useState<'cumulative' | 'daily'>('cumulative');
+    const [activeTab, setActiveTab] = useState<'cumulative' | 'daily' | 'discount'>('cumulative');
 
     // Helper for custom tooltip
     const CustomTooltip = ({ active, payload, label }: any) => {
@@ -28,18 +28,24 @@ export default function ChartsSection({ data }: { data: any }) {
     return (
         <div className="bg-neutral-900 border border-neutral-800 rounded-xl flex flex-col overflow-hidden">
             {/* Chart Header / Tabs */}
-            <div className="flex border-b border-neutral-800">
+            <div className="flex border-b border-neutral-800 overflow-x-auto">
                 <button
                     onClick={() => setActiveTab('cumulative')}
-                    className={`px-6 py-3 text-sm font-medium transition-colors ${activeTab === 'cumulative' ? 'bg-neutral-800 text-emerald-400 border-b-2 border-emerald-400' : 'text-neutral-400 hover:text-white'}`}
+                    className={`px-6 py-3 text-sm font-medium transition-colors whitespace-nowrap ${activeTab === 'cumulative' ? 'bg-neutral-800 text-emerald-400 border-b-2 border-emerald-400' : 'text-neutral-400 hover:text-white'}`}
                 >
                     Cumulative BTC
                 </button>
                 <button
                     onClick={() => setActiveTab('daily')}
-                    className={`px-6 py-3 text-sm font-medium transition-colors ${activeTab === 'daily' ? 'bg-neutral-800 text-blue-400 border-b-2 border-blue-400' : 'text-neutral-400 hover:text-white'}`}
+                    className={`px-6 py-3 text-sm font-medium transition-colors whitespace-nowrap ${activeTab === 'daily' ? 'bg-neutral-800 text-blue-400 border-b-2 border-blue-400' : 'text-neutral-400 hover:text-white'}`}
                 >
                     Daily Net BTC
+                </button>
+                <button
+                    onClick={() => setActiveTab('discount')}
+                    className={`px-6 py-3 text-sm font-medium transition-colors whitespace-nowrap ${activeTab === 'discount' ? 'bg-neutral-800 text-purple-400 border-b-2 border-purple-400' : 'text-neutral-400 hover:text-white'}`}
+                >
+                    Discount Rate %
                 </button>
             </div>
 
@@ -59,13 +65,22 @@ export default function ChartsSection({ data }: { data: any }) {
                             <Tooltip content={<CustomTooltip />} />
                             <Area name="Total BTC" type="stepAfter" dataKey="cumBtc" stroke="#10b981" strokeWidth={2} fillOpacity={1} fill="url(#colorBtc)" />
                         </AreaChart>
-                    ) : (
+                    ) : activeTab === 'daily' ? (
                         <BarChart data={data.daily}>
                             <CartesianGrid strokeDasharray="3 3" stroke="#262626" vertical={false} />
                             <XAxis dataKey="date" stroke="#525252" fontSize={10} tickLine={false} tickFormatter={(val) => val.slice(5)} />
                             <YAxis stroke="#525252" fontSize={10} tickLine={false} />
                             <Tooltip content={<CustomTooltip />} />
                             <Bar name="Net BTC" dataKey="netBtc" fill="#3b82f6" radius={[4, 4, 0, 0]} />
+                        </BarChart>
+                    ) : (
+                        <BarChart data={data.cumulative}>
+                            <CartesianGrid strokeDasharray="3 3" stroke="#262626" vertical={false} />
+                            <XAxis dataKey="date" stroke="#525252" fontSize={10} tickLine={false} tickFormatter={(val) => val.slice(5)} />
+                            <YAxis stroke="#525252" fontSize={10} tickLine={false} unit="%" />
+                            <Tooltip content={<CustomTooltip />} />
+                            <ReferenceLine y={0.6} stroke="#ef4444" strokeDasharray="3 3" label={{ position: 'top', value: 'Min Limit (0.6%)', fill: '#ef4444', fontSize: 10 }} />
+                            <Bar name="Discount %" dataKey="discountRate" fill="#a855f7" radius={[4, 4, 0, 0]} />
                         </BarChart>
                     )}
                 </ResponsiveContainer>

@@ -25,6 +25,13 @@ export default function KpiGrid({ kpi }: { kpi: any }) {
             color: 'text-cyan-400'
         },
         {
+            label: 'Avg Discount',
+            val: `${kpi.avgDiscount.toFixed(2)}%`,
+            sub: `Targeting > 0.90%`,
+            icon: TrendingUp,
+            color: 'text-purple-400'
+        },
+        {
             label: 'Realized USDT PnL',
             val: `$${kpi.totalPnL.toFixed(2)}`,
             sub: `Total Fees: $${kpi.totalFees.toFixed(2)}`,
@@ -48,7 +55,7 @@ export default function KpiGrid({ kpi }: { kpi: any }) {
     ];
 
     return (
-        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
+        <div className="grid grid-cols-2 lg:grid-cols-4 xl:grid-cols-7 gap-4">
             {cards.map((c, idx) => (
                 <div key={idx} className="bg-neutral-900 border border-neutral-800 p-4 rounded-xl hover:border-neutral-700 transition-colors">
                     <div className="flex justify-between items-start mb-2">
