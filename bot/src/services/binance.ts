@@ -46,14 +46,14 @@ export class BinanceService {
                     const filters: any = {};
                     s.filters.forEach((f: any) => {
                         if (f.filterType === 'NOTIONAL') {
-                            filters.minNotional = new Decimal(f.minNotional);
+                            filters.minNotional = new Decimal(f.minNotional || 0);
                         } else if (f.filterType === 'MIN_NOTIONAL') { // Legacy check
-                            filters.minNotional = new Decimal(f.minNotional);
+                            filters.minNotional = new Decimal(f.minNotional || 0);
                         } else if (f.filterType === 'LOT_SIZE') {
-                            filters.stepSize = new Decimal(f.stepSize);
-                            filters.minQty = new Decimal(f.minQty);
+                            filters.stepSize = new Decimal(f.stepSize || 0);
+                            filters.minQty = new Decimal(f.minQty || 0);
                         } else if (f.filterType === 'PRICE_FILTER') {
-                            filters.tickSize = new Decimal(f.tickSize);
+                            filters.tickSize = new Decimal(f.tickSize || 0);
                         }
                     });
 

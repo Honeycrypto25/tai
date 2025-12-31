@@ -8,6 +8,16 @@ import { Decimal } from 'decimal.js';
 
 export const policy = new PolicyEngine(prisma);
 
+// Guard: Safe Decimal Conversion
+const toDec = (v: any) => {
+    try {
+        if (v === null || v === undefined) return new Decimal(0);
+        return new Decimal(v);
+    } catch (e) {
+        return new Decimal(0);
+    }
+};
+
 /**
  * Helper: Reconcile Exchange vs DB Orders
  */
@@ -33,8 +43,8 @@ export async function reconcileState() {
                         where: { id: dbOrder.id },
                         data: {
                             status: check.status,
-                            executed_qty: new Decimal(check.executedQty),
-                            executed_quote_qty: new Decimal(check.cumQuoteQty)
+                            executed_qty: toDec(check.executedQty),
+                            executed_quote_qty: toDec(check.cumQuoteQty)
                         }
                     });
                 } catch (e) {
@@ -59,9 +69,9 @@ export async function reconcileState() {
                             side: o.side,
                             type: o.type,
                             status: o.status,
-                            price: new Decimal(o.price),
-                            orig_qty: new Decimal(o.origQty),
-                            executed_qty: new Decimal(o.executedQty),
+                            price: toDec(o.price),
+                            orig_qty: toDec(o.origQty),
+                            executed_qty: toDec(o.executedQty),
                             fee_asset: 'UNKNOWN'
                         }
                     });
@@ -100,45 +110,76 @@ export async function runCycle() {
             return;
         }
 
-        // Fetch Order Stats for Fees
-        // Count total filled orders to know if we can trust the stats
+        // Fee Stats
         const filledOrderCount = await prisma.order.count({ where: { status: 'FILLED', executed_qty: { gt: 0 } } });
         const feeStats = await stats.refreshFeeStats();
 
-        let estimatedFeeRate = new Decimal(0.0015); // Default 0.15% safe
+        let estimatedFeeRate = new Decimal(0.0015);
         let feeEstFallback = false;
 
         if (filledOrderCount >= 20 && feeStats.p90 > 0) {
-            estimatedFeeRate = new Decimal(feeStats.p90);
+            estimatedFeeRate = toDec(feeStats.p90);
         } else {
             feeEstFallback = true;
         }
 
         // Fetch Account Data
-        const account = await binance.getAccountInfo();
-        const btcBalanceObj = account.balances.find((b: any) => b.asset === 'BTC');
-        const usdtBalanceObj = account.balances.find((b: any) => b.asset === 'USDT');
+        let account;
+        try {
+            account = await binance.getAccountInfo();
+        } catch (e: any) {
+            console.error('[CORE] Failed to fetch account info:', e.message);
+            return;
+        }
 
-        const btcFree = new Decimal(btcBalanceObj?.free || 0);
-        const usdtFree = new Decimal(usdtBalanceObj?.free || 0);
+        // Robust Balance Extraction
+        const getBal = (asset: string): any => {
+            if (!account || !account.balances) return undefined;
+            const b = account.balances.find((x: any) => x.asset === asset);
+            return b;
+        };
 
-        // Get Price & Filters
+        const btcObj = getBal('BTC');
+        const usdtObj = getBal('USDT');
+
+        // Fallback checks for 'free' vs 'available' or direct structure
+        const extractFree = (obj: any): string | number | undefined => {
+            if (!obj) return undefined;
+            return obj.free ?? obj.available;
+        };
+
+        const btcFreeRaw = extractFree(btcObj);
+        const usdtFreeRaw = extractFree(usdtObj);
+
+        // Log Balances Raw for Debugging
+        console.log(`[BALANCES] BTC_RAW=${JSON.stringify(btcObj)} USDT_RAW=${JSON.stringify(usdtObj)}`);
+
+        if (btcFreeRaw === undefined || usdtFreeRaw === undefined) {
+            console.error('[CORE] Could not read balances from account response.');
+            return;
+        }
+
+        const btcFree = toDec(btcFreeRaw);
+        const usdtFree = toDec(usdtFreeRaw);
+
         const priceTick = await binance.getTickerPrice('BTCUSDT');
-        const currentPrice = new Decimal(priceTick);
+        const currentPrice = toDec(priceTick);
+
+        // Filters Safe Load
         const filters = binance.getCachedFilters('BTCUSDT');
         let stepSize = new Decimal('0.00001');
         let minNotional = new Decimal(10);
         if (filters) {
-            if (filters.stepSize) stepSize = new Decimal(filters.stepSize);
-            if (filters.minNotional) minNotional = new Decimal(filters.minNotional);
+            if (filters.stepSize) stepSize = toDec(filters.stepSize);
+            if (filters.minNotional) minNotional = toDec(filters.minNotional);
         }
 
-        // Calculate Equity (USDT)
-        const totalBtc = new Decimal(btcBalanceObj?.free || 0).add(btcBalanceObj?.locked || 0);
+        // Calculate Equity
+        const btcLocked = toDec(btcObj?.locked || 0);
+        const totalBtc = btcFree.add(btcLocked);
         const equityUsdt = usdtFree.add(totalBtc.mul(currentPrice));
 
-        // Dynamic Target Sell USDT (Reference Only)
-        // Used to gauge "Scale" of ops, but NOT frequency.
+        // Ref for Logs (Strategy Sizing)
         const targetSellUsdtRef = equityUsdt.div(10);
 
         console.log(`[STATUS] Equity: $${equityUsdt.toFixed(2)} | BTC Free: ${btcFree} | USDT Free: $${usdtFree.toFixed(2)} | TargetSellRef: $${targetSellUsdtRef.toFixed(2)}`);
@@ -154,7 +195,7 @@ export async function runCycle() {
 
         const now = Date.now();
         const ONE_DAY_MS = 24 * 60 * 60 * 1000;
-        let timeSinceSell = ONE_DAY_MS + 1000; // Default: Ready
+        let timeSinceSell = ONE_DAY_MS + 1000;
         let nextSellAllowedAt = new Date(now);
 
         if (lastFilledSell) {
@@ -169,53 +210,65 @@ export async function runCycle() {
         if (timeSinceSell > ONE_DAY_MS) {
 
             // Check Conditions
-            const btcToSellRaw = btcFree.div(10); // Policy: 10% of Free BTC
-
-            // Rounding
-            const remainder = btcToSellRaw.mod(stepSize);
-            const sellQtyRounded = btcToSellRaw.minus(remainder);
-            const estNotional = sellQtyRounded.mul(currentPrice);
-
-            // Validations
-            if (btcFree.lt(0.0005)) {
-                sellReason = `BTC Balance too low (${btcFree})`;
-            } else if (estNotional.lt(minNotional)) {
-                sellReason = `minNotional $${estNotional.toFixed(2)} < $${minNotional}`;
-            } else if (sellQtyRounded.eq(0)) {
-                sellReason = `qty round to 0`;
+            // Check for potential undefined/NaN propagation
+            if (!btcFree.isFinite() || !stepSize.isFinite()) {
+                sellDecision = 'SKIP';
+                sellReason = 'Invalid/Infinite Balance or Steps';
             } else {
-                sellDecision = 'SELL';
-            }
+                const btcToSellRaw = btcFree.div(10);
 
-            // Excecute
-            if (sellDecision === 'SELL') {
-                if (!settings.dry_run) {
-                    try {
-                        const clientOrderId = `ASELL_${config.MODE}_${now}`;
-                        console.log(`[EXECUTION] Placing MARKET SELL for ${sellQtyRounded} BTC...`);
-                        const order = await binance.placeMarketSell('BTCUSDT', sellQtyRounded, clientOrderId);
+                // Rounding
+                const remainder = btcToSellRaw.mod(stepSize);
+                const sellQtyRounded = btcToSellRaw.minus(remainder);
+                const estNotional = sellQtyRounded.mul(currentPrice);
 
-                        await prisma.order.create({
-                            data: {
-                                client_order_id: clientOrderId,
-                                exchange_order_id: order.orderId.toString(),
-                                env: config.MODE, side: 'SELL', type: 'MARKET', status: order.status || 'FILLED',
-                                price: new Decimal(order.avgPrice || currentPrice),
-                                orig_qty: sellQtyRounded,
-                                executed_qty: new Decimal(order.executedQty),
-                                executed_quote_qty: new Decimal(order.cumQuoteQty),
-                                fee_asset: 'USDT'
-                            }
-                        });
-                        console.log('[EXECUTION] Sell Success.');
-                    } catch (e: any) {
-                        console.error('[EXECUTION] Sell Failed:', e.message);
-                        sellDecision = 'FAIL';
-                        sellReason = e.message;
-                    }
+                // Validations
+                if (btcFree.lt(0.0005)) {
+                    sellReason = `BTC Balance too low (${btcFree})`;
+                } else if (estNotional.lt(minNotional)) {
+                    sellReason = `minNotional $${estNotional.toFixed(2)} < $${minNotional}`;
+                } else if (sellQtyRounded.eq(0)) {
+                    sellReason = `qty round to 0`;
                 } else {
-                    console.log(`[DRY-RUN] Would SELL ${sellQtyRounded} BTC.`);
-                    sellDecision = 'DRY_SELL';
+                    sellDecision = 'SELL';
+                }
+
+                // Execute
+                if (sellDecision === 'SELL') {
+                    if (!settings.dry_run) {
+                        try {
+                            const clientOrderId = `ASELL_${config.MODE}_${now}`;
+                            console.log(`[EXECUTION] Placing MARKET SELL for ${sellQtyRounded} BTC...`);
+
+                            // Safe check before API call
+                            if (sellQtyRounded.isNaN() || !sellQtyRounded.isFinite()) {
+                                throw new Error('Calculated Sell Qty is NaN/Infinite');
+                            }
+
+                            const order = await binance.placeMarketSell('BTCUSDT', sellQtyRounded, clientOrderId);
+
+                            await prisma.order.create({
+                                data: {
+                                    client_order_id: clientOrderId,
+                                    exchange_order_id: order.orderId.toString(),
+                                    env: config.MODE, side: 'SELL', type: 'MARKET', status: order.status || 'FILLED',
+                                    price: toDec(order.avgPrice || currentPrice),
+                                    orig_qty: sellQtyRounded,
+                                    executed_qty: toDec(order.executedQty),
+                                    executed_quote_qty: toDec(order.cumQuoteQty),
+                                    fee_asset: 'USDT'
+                                }
+                            });
+                            console.log('[EXECUTION] Sell Success.');
+                        } catch (e: any) {
+                            console.error('[EXECUTION] Sell Failed:', e.message);
+                            sellDecision = 'FAIL';
+                            sellReason = e.message;
+                        }
+                    } else {
+                        console.log(`[DRY-RUN] Would SELL ${sellQtyRounded} BTC.`);
+                        sellDecision = 'DRY_SELL';
+                    }
                 }
             }
 
@@ -223,15 +276,12 @@ export async function runCycle() {
             sellReason = `Last sell ${(hoursAgo).toFixed(2)}h ago (Must be > 24h)`;
         }
 
-        // REQUIRED LOG: SELL LOGIC
         console.log(`[SELL-LOGIC] TS:${lastFilledSell?.updated_at.toISOString() || 'NONE'} | Ago:${hoursAgo.toFixed(2)}h | Next:${nextSellAllowedAt.toISOString()} | Decision:${sellDecision} (${sellReason})`);
 
 
         // --- 2. BUY STRATEGY (Accumulation / Ladder) ---
 
-        // Count Active Buys
         const openBuysCount = await prisma.order.count({ where: { side: 'BUY', status: 'NEW', env: config.MODE } });
-        // Consistency check: The simple count above is our truth for "slots".
 
         let buyDecision = 'SKIP';
         let buyReason = '';
@@ -241,7 +291,7 @@ export async function runCycle() {
             buyReason = `Max Open Buys Reached (${openBuysCount}/${settings.max_open_buys})`;
         } else {
             // "AI" Logic: Discount Calculation
-            const feeBuffer = estimatedFeeRate.mul(2); // Safety roundtrip
+            const feeBuffer = estimatedFeeRate.mul(2);
             const minDiscountSetting = settings.min_discount_net_fees || new Decimal(0.6);
             const minRequiredDiscount = feeBuffer.add(minDiscountSetting.div(100));
 
@@ -251,7 +301,9 @@ export async function runCycle() {
             if (candles.length > 5) {
                 let trSum = new Decimal(0);
                 for (let i = 0; i < candles.length - 1; i++) {
-                    const h = candles[i].high, l = candles[i].low, pc = candles[i + 1].close;
+                    const h = toDec(candles[i].high);
+                    const l = toDec(candles[i].low);
+                    const pc = toDec(candles[i + 1].close);
                     trSum = trSum.add(Decimal.max(h.minus(l), h.minus(pc).abs(), l.minus(pc).abs()));
                 }
                 atrPct = trSum.div(candles.length - 1).div(currentPrice);
@@ -260,10 +312,8 @@ export async function runCycle() {
             const ladderDepthPct = new Decimal(0.005).mul(openBuysCount);
             let calculatedDiscount = minRequiredDiscount.add(atrPct.mul(0.5)).add(ladderDepthPct);
 
-            // Fallback / Cap
-            // Ensure we don't hold if formula goes weird, but we MUST respect minimums.
-            // "Fallback simplu: max(min_calc, X%)"
-            const fallbackDiscount = minRequiredDiscount.add(new Decimal(0.005)); // Min + 0.5%
+            // Fallback
+            const fallbackDiscount = minRequiredDiscount.add(new Decimal(0.005));
             if (calculatedDiscount.lt(fallbackDiscount)) {
                 calculatedDiscount = fallbackDiscount;
             }
@@ -284,17 +334,15 @@ export async function runCycle() {
                 const buyQtyRaw = usdtToInvest.div(targetPrice);
                 const buyQty = buyQtyRaw.div(stepSize).floor().mul(stepSize);
 
-                // Anti-Duplicate Guard
                 const currentOpenOrders = await binance.getOpenOrders('BTCUSDT');
                 const duplicate = currentOpenOrders.find((o: any) => {
                     if (o.side !== 'BUY' || o.status !== 'NEW') return false;
-                    const oPrice = new Decimal(o.price);
-                    const oQty = new Decimal(o.origQty);
+                    const oPrice = toDec(o.price);
+                    const oQty = toDec(o.origQty);
 
-                    const priceDelta = oPrice.minus(targetPrice).abs(); // Abs diff
+                    const priceDelta = oPrice.minus(targetPrice).abs();
                     const qtyDeltaPct = oQty.minus(buyQty).abs().div(buyQty);
 
-                    // Duplicate if Price < $5 diff AND Qty < 5% diff
                     return (priceDelta.lt(5) && qtyDeltaPct.lt(0.05));
                 });
 
@@ -303,7 +351,6 @@ export async function runCycle() {
                     buyReason = `Duplicate Found: ID=${duplicate.clientOrderId} P=${duplicate.price} Q=${duplicate.origQty} vs Tgt=${targetPrice.toFixed(2)}/${buyQty}`;
                 } else {
                     buyDecision = 'PLACE';
-                    // Execute
                     if (!settings.dry_run) {
                         try {
                             const clientOrderId = `ABUY_${config.MODE}_${now}`;
@@ -335,7 +382,7 @@ export async function runCycle() {
     }
 }
 
-// Main Entry Wrapper
+// Main Entry
 if (require.main === module) {
     (async () => {
         console.log('-------------------------------------------');
@@ -354,6 +401,7 @@ if (require.main === module) {
             const start = Date.now();
             await runCycle();
             const elapsed = Date.now() - start;
+            // Loop ~60s
             const delay = Math.max(1000, 60000 - elapsed);
             await new Promise(r => setTimeout(r, delay));
         }
