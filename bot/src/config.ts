@@ -19,6 +19,7 @@ interface BotConfig {
     // Trading Mode
     MODE: BotMode;
     DRY_RUN: boolean;
+    LOOP_MINUTES: number;
 
     // Binance
     BINANCE: {
@@ -61,6 +62,7 @@ export const config: BotConfig = {
 
     MODE: mode,
     DRY_RUN: process.env.DRY_RUN === 'true', // Defaults to false if not set
+    LOOP_MINUTES: parseInt(process.env.LOOP_MINUTES || '60', 10),
 
     BINANCE: {
         // Allows override, but sets clear defaults based on docs if not provided (though README says provide them)
