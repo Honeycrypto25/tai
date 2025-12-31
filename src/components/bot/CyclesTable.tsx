@@ -1,4 +1,3 @@
-
 import React from 'react';
 import { CheckCircle2, Clock } from 'lucide-react';
 import { format } from 'date-fns';
@@ -14,8 +13,8 @@ export default function CyclesTable({ cycles }: { cycles: any[] }) {
                             <th className="px-4 py-3">Status</th>
                             <th className="px-4 py-3">Sell (Entry)</th>
                             <th className="px-4 py-3">Buy (Exit)</th>
-                            <th className="px-4 py-3 text-right">PnL</th>
-                            <th className="px-4 py-3 text-right">ROI</th>
+                            <th className="px-4 py-3 text-right text-emerald-400">Net BTC</th>
+                            <th className="px-4 py-3 text-right">PnL (USDT)</th>
                         </tr>
                     </thead>
                     <tbody className="divide-y divide-neutral-800">
@@ -64,11 +63,11 @@ export default function CyclesTable({ cycles }: { cycles: any[] }) {
                                         <span className="text-neutral-700 italic">Pending...</span>
                                     )}
                                 </td>
-                                <td className={`px-4 py-3 text-right font-mono font-bold ${c.pnl > 0 ? 'text-emerald-400' : c.pnl < 0 ? 'text-rose-400' : 'text-neutral-500'}`}>
-                                    {c.status === 'CLOSED' ? `$${c.pnl.toFixed(2)}` : '-'}
+                                <td className="px-4 py-3 text-right font-mono font-bold text-emerald-400">
+                                    {c.netBtc !== undefined ? `+${parseFloat(c.netBtc).toFixed(6)}` : '-'}
                                 </td>
-                                <td className={`px-4 py-3 text-right font-mono ${c.pnlPct > 0 ? 'text-emerald-500' : 'text-rose-500'}`}>
-                                    {c.status === 'CLOSED' ? `${c.pnlPct.toFixed(2)}%` : '-'}
+                                <td className={`px-4 py-3 text-right font-mono ${c.pnl > 0 ? 'text-emerald-500' : 'text-neutral-500'}`}>
+                                    {c.status === 'CLOSED' ? `$${c.pnl.toFixed(2)}` : '-'}
                                 </td>
                             </tr>
                         ))}
