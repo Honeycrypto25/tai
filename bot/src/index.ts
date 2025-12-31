@@ -381,24 +381,40 @@ export async function runCycle() {
 
         const targetPrice = currentPrice.mul(new Decimal(1).minus(finalDiscount));
 
-        // Sizing: Equity / 10
+        // Sizing Strategy: Equity / 10
         const targetShare = new Decimal(0.10);
-        let usdtToInvest = equityUsdt.mul(targetShare);
+        const rawTarget = equityUsdt.mul(targetShare);
 
         // Min Floor (User Requirement: target_sell_usdt ~20)
         const minSize = toDec(settings.target_sell_usdt).gt(0) ? toDec(settings.target_sell_usdt) : new Decimal(20);
-        if (usdtToInvest.lt(minSize)) usdtToInvest = minSize;
+
+        // 1. Target with Floor
+        let finalUsdtSize = rawTarget;
+        if (finalUsdtSize.lt(minSize)) finalUsdtSize = minSize;
+
+        // 2. Cap by Available USDT (Accumulation Mode: Use what we have)
+        const isCapped = usdtFree.lt(finalUsdtSize);
+        if (isCapped) {
+            finalUsdtSize = usdtFree;
+        }
+
+        console.log(`[SIZING] EquityTotal=${equityUsdt.toFixed(2)} | Target(10%)=${rawTarget.toFixed(2)} | MinFloor=${minSize.toFixed(2)} | UsdtFree=${usdtFree.toFixed(2)} | CapByFree=${isCapped} | FinalOrderUSDT=${finalUsdtSize.toFixed(2)}`);
 
         const openBuysCount = await prisma.order.count({ where: { side: 'BUY', status: 'NEW', env: config.MODE } });
+
+        // Min Notional Check (Binance requires > 5-10 USDT)
+        // If we are capped at 19 USDT (and minFloor is 20), we should still trade if above absolute exchange min.
+        // We will assume 12 USDT is absolute safe floor for Binance.
+        const absoluteMin = new Decimal(12);
 
         if (openBuysCount >= settings.max_open_buys) {
             buyDecision = 'SKIP';
             buyReason = `Max Open Buys Reached (${openBuysCount}/${settings.max_open_buys})`;
-        } else if (usdtFree.lt(usdtToInvest)) {
+        } else if (finalUsdtSize.lt(absoluteMin)) {
             buyDecision = 'SKIP';
-            buyReason = `Insufficient USDT (${usdtFree.toFixed(2)}) < Required (${usdtToInvest.toFixed(2)})`;
+            buyReason = `Order Size ${finalUsdtSize.toFixed(2)} < Absolute Min ${absoluteMin} (Too low balance)`;
         } else {
-            const buyQtyRaw = usdtToInvest.div(targetPrice);
+            const buyQtyRaw = finalUsdtSize.div(targetPrice);
             const buyQty = buyQtyRaw.div(stepSize).floor().mul(stepSize);
 
             // Duplicate Scan (Safety)
