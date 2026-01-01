@@ -61,7 +61,7 @@ export async function getBotStats(timeRange: DashboardFilter = '30d') {
     const startOfTodayMs = startOfToday.getTime();
 
     for (const o of orders) {
-        if (o.side === 'BUY' && o.status === 'NEW') {
+        if (o.side === 'BUY' && (o.status === 'NEW' || o.status === 'PARTIALLY_FILLED')) {
             openBuys.push(o);
         }
         if (!o.cycle_id) {
@@ -95,7 +95,7 @@ export async function getBotStats(timeRange: DashboardFilter = '30d') {
                 c.volume = sellVal;
                 totalVolume = totalVolume.add(sellVal);
 
-                if (c.buy && (c.buy.status === 'FILLED' || c.buy.status === 'PARTIALLY_FILLED')) {
+                if (c.buy && c.buy.status === 'FILLED') {
                     // CLOSED CYCLE
                     c.status = 'CLOSED';
                     const buyVal = new Decimal(c.buy.executed_quote_qty);
