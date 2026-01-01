@@ -50,7 +50,7 @@ export default function ChartsSection({ data }: { data: any }) {
             </div>
 
             <div className="p-6 h-[400px] w-full min-w-0">
-                <ResponsiveContainer width="100%" height="100%">
+                <ResponsiveContainer width="100%" height="100%" minWidth={0}>
                     {activeTab === 'cumulative' ? (
                         <AreaChart data={data.cumulative}>
                             <defs>

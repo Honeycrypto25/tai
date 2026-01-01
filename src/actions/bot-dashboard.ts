@@ -229,5 +229,6 @@ export async function getBotStats(timeRange: DashboardFilter = '30d') {
 }
 
 function numberSafe(d: Decimal) {
+    if (!d || typeof d.toNumber !== 'function') return 0;
     return d.toNumber();
 }
