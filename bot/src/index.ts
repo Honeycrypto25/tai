@@ -44,7 +44,7 @@ export async function reconcileState() {
                         data: {
                             status: check.status,
                             executed_qty: toDec(check.executedQty),
-                            executed_quote_qty: toDec(check.cumQuoteQty)
+                            executed_quote_qty: toDec(check.cumQuoteQty || check.cummulativeQuoteQty || check.cumulativeQuoteQty)
                         }
                     });
                 } catch (e) {
@@ -274,7 +274,7 @@ export async function runCycle() {
                                     price: toDec(order.avgPrice || currentPrice),
                                     orig_qty: sellQtyRounded,
                                     executed_qty: toDec(order.executedQty),
-                                    executed_quote_qty: toDec(order.cumQuoteQty),
+                                    executed_quote_qty: toDec(order.cumQuoteQty || order.cummulativeQuoteQty || order.cumulativeQuoteQty),
                                     fee_asset: 'USDT'
                                 }
                             });
