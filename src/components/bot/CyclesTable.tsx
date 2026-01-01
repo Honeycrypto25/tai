@@ -66,8 +66,8 @@ export default function CyclesTable({ cycles }: { cycles: any[] }) {
                                 <td className="px-4 py-3 text-right font-mono font-bold text-emerald-400">
                                     {c.netBtc !== undefined ? `+${parseFloat(c.netBtc).toFixed(6)}` : '-'}
                                 </td>
-                                <td className={`px-4 py-3 text-right font-mono ${c.pnl > 0 ? 'text-emerald-500' : 'text-neutral-500'}`}>
-                                    {c.status === 'CLOSED' ? `$${c.pnl.toFixed(2)}` : '-'}
+                                <td className={`px-4 py-3 text-right font-mono ${parseFloat(c.pnl) > 0 ? 'text-emerald-500' : 'text-neutral-500'}`}>
+                                    {c.status === 'CLOSED' ? `$${parseFloat(c.pnl).toFixed(2)}` : '-'}
                                 </td>
                             </tr>
                         ))}
